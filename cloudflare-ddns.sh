@@ -192,7 +192,8 @@ main()
 }
 
 # Keep files in the same folder when run from cron
-CURRENT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+CURRENT="$(pwd)"
+cd "$(dirname "$(readlink -f "$0")")"
 
 # Setup some key variables
 CONFIG_FILE="cloudflare-ddns.conf"
