@@ -27,6 +27,16 @@ _error() {
 	exit 2
 }
 
+_printargs() {
+    printf -- "%s" "[$(date)] "
+    printf -- "%s" "$1"
+    printf "\n"
+}
+
+_info() {
+    _printargs "$@"
+}
+
 _exists() {
 	local cmd="$1"
 	if eval type type > /dev/null 2>&1; then
