@@ -3,7 +3,7 @@
 ## Introduction
 If you run a server from your home network, or perhaps simply want to access your home computer when you are away from home, one challenge is determining what your IP address is as most domestic internet connections have a dynamic IP address that changes from time to time. To get over this issue you will need to use a Dynamic DNS provider.
 
-I use Cloudflare as my DNS provider but I was unable to find any dynamic DNS client that supported the new V4 API, and some of the scripts I found on GitHub did not contain enough error checking for my liking. I therefore decided to build upon their concepts and create my own script which is currently running on ac[Raspberry Pi](https://www.raspberrypi.org/) running [Raspbian](https://www.raspbian.org/) and also on server that is running [Ubuntu](https://ubuntu.com/server). This script should also be able to run on most Linux systems as long as the pre-requisites are met.
+I use Cloudflare as my DNS provider but I was unable to find any dynamic DNS client that supported the new V4 API, and some of the scripts I found on GitHub did not contain enough error checking for my liking. I therefore decided to build upon their concepts and create my own script which is currently running on a [Raspberry Pi](https://www.raspberrypi.org/) running [Raspbian](https://www.raspbian.org/) and also on server that is running [Ubuntu](https://ubuntu.com/server). This script should also be able to run on most Linux systems as long as the pre-requisites are met.
 
 ## Prerequisites
 
