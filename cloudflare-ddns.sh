@@ -20,6 +20,16 @@ _red() {
 	printf '\033[1;31;31m%b\033[0m' "$1"
 }
 
+_yellow() {
+    printf '\033[1;31;33m%b\033[0m' "$1"
+}
+
+_warn() {
+    printf -- "%s" "[$(date)] "
+    _yellow "$1"
+    printf "\n"
+}
+
 _error() {
 	printf -- "%s" "[$(date)] "
 	_red "$1"
@@ -35,6 +45,13 @@ _printargs() {
 
 _info() {
     _printargs "$@"
+}
+
+_exit() {
+    printf "\n"
+    _red "$0 has been terminated."
+    printf "\n"
+    exit 1
 }
 
 _exists() {
@@ -86,7 +103,21 @@ load_config()
 {
 	# Check if the configuration file exists, if not then no need to go any further
 	if [[ ! -e "$CONFIG_FILE" ]]; then
-		_error "Unable to find $CONFIG_FILE"
+		cat > $CONFIG_FILE <<EOF
+# Cloudflare as a Dynamic DNS Provider
+
+# Update these with your values
+AUTH_EMAIL="YOUR_CLOUDFLARE_AUTH_EMAIL"
+AUTH_KEY="YOUR_CLOUDFLARE_AUTH_KEY" 
+ZONE_NAME="example.com"
+RECORD_NAME="site.example.com"
+
+# This can be any IP checking site that returns the IP as plain text
+IP_CHECK_URL="http://ipv4.icanhazip.com"
+EOF
+		_warn "A configuration file was not found, $CONFIG_FILE has been created."
+		_warn "This file contains template information. Please update it with your values."
+		_exit 
 	fi
 
 	# Load the config file	
