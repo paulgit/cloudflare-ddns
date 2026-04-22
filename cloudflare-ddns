@@ -425,8 +425,8 @@ function load_config() {
   fi
 
   local current_mode
-  current_mode=$(stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null \
-    || stat -c '%a' "$CONFIG_FILE" 2>/dev/null)
+  current_mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null \
+    || stat -f '%OLp' "$CONFIG_FILE" 2>/dev/null)
   if [[ "$current_mode" != "600" ]]; then
     _warn "Config file has insecure permissions ${current_mode}. Fixing to 600."
     chmod 600 "$CONFIG_FILE"
