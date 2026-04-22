@@ -1,4 +1,4 @@
-# Cloudflare Dynamic DNS &nbsp;![Version](https://img.shields.io/badge/version-2.0-blue)
+# Cloudflare Dynamic DNS &nbsp;![Version](https://img.shields.io/badge/version-2.1-blue)
 
 ## Introduction
 
