@@ -1,0 +1,707 @@
+#!/usr/bin/env bash
+# ============================================================
+# cloudflare-ddns
+# Version: 2.0
+#
+# Uses Cloudflare as a Dynamic DNS provider to keep DNS records
+# automatically updated with the current public IP address.
+#
+# Design choices:
+#  - Authentication: API Token (preferred) with fallback to the
+#    legacy Global API Key. Tokens can be scoped to DNS:Edit on
+#    a single zone, limiting blast radius if leaked.
+#  - Config format: JSON, read via jq. Default location is
+#    ~/.config/cloudflare-ddns/cloudflare-ddns.json (respects
+#    $XDG_CONFIG_HOME). Override with --config PATH.
+#  - Runtime data (cached IDs, log, lock) go in
+#    ~/.cloudflare-ddns — user-private, outside any repo tree.
+#  - Current DNS IP source: Cloudflare API rather than a dig
+#    query, eliminating DNS propagation lag and the dig
+#    dependency.
+#  - Concurrency guard: a per-user directory lock in /tmp
+#    prevents overlapping cron invocations.
+#  - Colour output: auto-detected via TTY; suppressed by the
+#    NO_COLOR env var (https://no-color.org/) or by the
+#    --no-color / --cron-mode command-line flags.
+#  - Dry-run mode: all steps run (config load, auth check,
+#    IP comparison) but the DNS PATCH call is skipped.
+#
+# Reference URLs:
+#  https://letswp.io/cloudflare-as-dynamic-dns-raspberry-pi/
+#  https://gist.github.com/benkulbertis/fff10759c2391b6618dd/
+#  https://no-color.org/
+#
+# Credits:
+#  Thanks to https://github.com/teddysun and his great scripts
+#  that have inspired me with ideas to create my own.
+#
+# Disclaimer: No warranties are given for correct function.
+# Written by: Paul Git and Claude AI
+#
+# Variable names are uppercased if the variable is read-only
+# or if it is an external variable.
+# ============================================================
+
+set -o errexit   # abort on nonzero exitstatus
+set -o nounset   # abort on unbound variable
+set -o pipefail  # don't hide errors within pipes
+
+IFS=$'\n\t'
+
+# ------------------------------------------------------------
+# Global read-only variables
+# ------------------------------------------------------------
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+readonly VERSION="2.0"
+# Runtime data goes in a private home-directory subtree.
+readonly DATA_DIR="$HOME/.cloudflare-ddns"
+readonly ID_FILE="$DATA_DIR/cloudflare.ids"
+readonly LOG_FILE="$DATA_DIR/cloudflare.log"
+# Per-user lock allows different users to run simultaneously.
+LOCK_FILE="/tmp/cloudflare-ddns-$(id -u).lock"
+readonly LOCK_FILE
+
+# ------------------------------------------------------------
+# Global mutable variables
+# ------------------------------------------------------------
+# Default config path; overridden by --config in main().
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_FILE+="/cloudflare-ddns/cloudflare-ddns.json"
+
+ZONE_IDENTIFIER=""
+RECORD_IDENTIFIER=""
+
+# Set to 1 by --dry-run; skips the DNS record update API call.
+DRY_RUN=0
+
+# Colour output: enabled when stdout or stderr is a terminal
+# and the NO_COLOR convention (https://no-color.org/) is unset.
+# Overridden to 0 by --no-color / --cron-mode in main().
+USE_COLOR=0
+if { [[ -t 1 ]] || [[ -t 2 ]]; } \
+     && [[ -z "${NO_COLOR:-}" ]]; then
+  USE_COLOR=1
+fi
+
+# Cloudflare API auth headers; populated by build_auth_args()
+# after the config file is parsed.
+declare -a CURL_AUTH_ARGS=()
+
+# ============================================================
+# _color_text
+#   Applies an ANSI SGR sequence to text when colour is on.
+#   Input:  $1 - SGR attribute string (e.g. "1;31")
+#           $2 - message text
+#   Output: formatted (or plain) text to stdout
+#   Called by: _red, _yellow
+# ============================================================
+function _color_text() {
+  local code="$1"
+  local message="$2"
+  if [[ "$USE_COLOR" -eq 1 ]]; then
+    printf '\033[%sm%b\033[0m' "$code" "$message"
+  else
+    printf '%b' "$message"
+  fi
+}
+
+# ============================================================
+# _red
+#   Outputs bold-red text (or plain text when colour is off).
+#   Input:  $1 - message
+#   Output: formatted text to stdout
+#   Called by: _error
+# ============================================================
+function _red() {
+  _color_text "1;31" "$1"
+}
+
+# ============================================================
+# _yellow
+#   Outputs bold-yellow text (or plain text when colour is off).
+#   Input:  $1 - message
+#   Output: formatted text to stdout
+#   Called by: _warn
+# ============================================================
+function _yellow() {
+  _color_text "1;33" "$1"
+}
+
+# ============================================================
+# _log_to_file
+#   Appends a UTC-timestamped entry to LOG_FILE. Write errors
+#   are silently ignored so a full or missing log never aborts
+#   a DNS update.
+#   Input:  $1 - severity label (INFO, WARN, ERROR)
+#           $2 - message
+#   Output: one line appended to LOG_FILE
+#   Called by: _info, _warn, _error
+# ============================================================
+function _log_to_file() {
+  local level="$1"
+  local message="$2"
+  printf '%s [%s] %s\n' \
+    "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$message" \
+    >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# ============================================================
+# _info
+#   Prints an informational message with timestamp to stdout
+#   and appends it to the log file.
+#   Input:  $1 - message
+#   Output: timestamped message to stdout; entry in LOG_FILE
+#   Called by: update_dns_record, check_for_ip_change
+# ============================================================
+function _info() {
+  local message="$1"
+  printf '[%s] %s\n' "$(date)" "$message"
+  _log_to_file "INFO" "$message"
+}
+
+# ============================================================
+# _warn
+#   Prints a bold-yellow warning with timestamp to stderr and
+#   appends it to the log file.
+#   Input:  $1 - warning message
+#   Output: timestamped warning to stderr; entry in LOG_FILE
+#   Called by: load_config, load_or_fetch_identifiers,
+#              build_auth_args, check_for_ip_change
+# ============================================================
+function _warn() {
+  local message="$1"
+  {
+    printf '[%s] ' "$(date)"
+    _yellow "WARN: $message"
+    printf '\n'
+  } >&2
+  _log_to_file "WARN" "$message"
+}
+
+# ============================================================
+# _error
+#   Prints a bold-red error with timestamp to stderr, appends
+#   it to the log file, and exits with code 2.
+#   Input:  $1 - error message
+#   Output: timestamped error to stderr; entry in LOG_FILE;
+#           exits with code 2
+#   Called by: check_dependencies, validate_config,
+#              build_auth_args, cloudflare_api_call,
+#              check_api_response, fetch_identifiers,
+#              check_for_ip_change, acquire_lock, main
+# ============================================================
+function _error() {
+  local message="$1"
+  {
+    printf '[%s] ' "$(date)"
+    _red "ERROR: $message"
+    printf '\n'
+  } >&2
+  _log_to_file "ERROR" "$message"
+  exit 2
+}
+
+# ============================================================
+# show_usage
+#   Prints usage information to stdout.
+#   Input:  none
+#   Output: usage text to stdout
+#   Called by: main
+# ============================================================
+function show_usage() {
+  cat <<EOF
+Usage: ${SCRIPT_NAME} [OPTIONS]
+
+Uses Cloudflare as a Dynamic DNS provider to keep DNS records
+automatically updated with the current public IP address.
+
+Options:
+  -h, --help              Show this help message and exit.
+  --version               Print the version number and exit.
+  --config PATH           Path to the JSON configuration file.
+                          Default: ~/.config/cloudflare-ddns/
+                                   cloudflare-ddns.json
+  --dry-run               Run the full check (load config, auth,
+                          fetch public IP, read current DNS IP)
+                          but do not apply any DNS changes.
+                          Logs and prints what would have changed.
+  --no-color, --cron-mode Disable coloured output. Colour is
+                          also suppressed automatically when
+                          not attached to a terminal or when
+                          the NO_COLOR env var is set.
+EOF
+}
+
+# ============================================================
+# check_dependencies
+#   Verifies that required external tools are installed.
+#   Input:  none
+#   Output: error to stderr and exit if a tool is missing
+#   Called by: main
+# ============================================================
+function check_dependencies() {
+  local tool
+  for tool in curl jq; do
+    if ! command -v "$tool" &>/dev/null; then
+      _error "'${tool}' is required but not installed."
+    fi
+  done
+}
+
+# ============================================================
+# cleanup
+#   Removes the lock directory on exit.
+#   Input:  none
+#   Output: lock directory removed if it exists
+#   Called by: trap on EXIT, trap on ERR
+# ============================================================
+function cleanup() {
+  [[ -d "${LOCK_FILE}" ]] && rm -rf "$LOCK_FILE"
+}
+
+trap cleanup EXIT ERR
+
+# ============================================================
+# acquire_lock
+#   Creates a lock directory atomically to prevent concurrent
+#   runs. Exits with an error if the lock is already held.
+#   Input:  none
+#   Output: lock directory and PID file created at LOCK_FILE
+#   Called by: main
+# ============================================================
+function acquire_lock() {
+  if ! mkdir "$LOCK_FILE" 2>/dev/null; then
+    local lock_pid="unknown"
+    [[ -f "$LOCK_FILE/pid" ]] \
+      && lock_pid=$(cat "$LOCK_FILE/pid")
+    _error "Another instance is already running (PID: ${lock_pid})."
+  fi
+  printf '%s\n' "$$" > "$LOCK_FILE/pid"
+}
+
+# ============================================================
+# _valid_ip
+#   Validates whether a string is a valid IPv4 address.
+#   Input:  $1 - string to validate
+#   Output: returns 0 if valid, 1 if invalid
+#   Called by: check_for_ip_change
+# ============================================================
+function _valid_ip() {
+  local ip="$1"
+  local stat=1
+  local regex='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'
+  if [[ $ip =~ $regex ]]; then
+    local -a ip_parts
+    IFS='.' read -ra ip_parts <<< "$ip"
+    [[ ${ip_parts[0]} -le 255 && ${ip_parts[1]} -le 255 \
+      && ${ip_parts[2]} -le 255 && ${ip_parts[3]} -le 255 ]]
+    stat=$?
+  fi
+  return "$stat"
+}
+
+# ============================================================
+# init_data_dir
+#   Creates the runtime data directory with strict permissions
+#   if it does not already exist, then enforces mode 700.
+#   Input:  none
+#   Output: DATA_DIR exists with mode 700
+#   Called by: main
+# ============================================================
+function init_data_dir() {
+  [[ -d "$DATA_DIR" ]] || mkdir -m 700 "$DATA_DIR"
+  chmod 700 "$DATA_DIR"
+}
+
+# ============================================================
+# create_config_template
+#   Creates the config directory and writes a JSON template to
+#   CONFIG_FILE (mode 600), then exits so the user can edit it.
+#   Input:  none
+#   Output: config directory and CONFIG_FILE created
+#   Called by: load_config
+# ============================================================
+function create_config_template() {
+  local config_dir
+  config_dir="$(dirname "$CONFIG_FILE")"
+  [[ -d "$config_dir" ]] || mkdir -p "$config_dir"
+  chmod 700 "$config_dir"
+
+  cat > "$CONFIG_FILE" <<'EOF'
+{
+  "auth_token": "YOUR_CLOUDFLARE_API_TOKEN",
+  "zone_name": "example.com",
+  "record_name": "ddns.example.com",
+  "ip_check_url": "https://ipv4.icanhazip.com"
+}
+EOF
+  chmod 600 "$CONFIG_FILE"
+}
+
+# ============================================================
+# validate_config
+#   Verifies required config fields are populated and that no
+#   placeholder values remain after parsing the config file.
+#   Input:  none (reads globals set by load_config)
+#   Output: error and exit if validation fails
+#   Called by: load_config
+# ============================================================
+function validate_config() {
+  local var json_key
+  for var in ZONE_NAME RECORD_NAME IP_CHECK_URL; do
+    if [[ -z "${!var:-}" ]]; then
+      json_key="${var,,}"
+      _error "Required field '${json_key}' not set in ${CONFIG_FILE}."
+    fi
+  done
+
+  local auth_ok=0
+  if [[ -n "${AUTH_TOKEN:-}" ]] \
+      && ! [[ "${AUTH_TOKEN}" =~ ^YOUR_ ]]; then
+    auth_ok=1
+  elif [[ -n "${AUTH_EMAIL:-}" && -n "${AUTH_KEY:-}" ]] \
+      && ! [[ "${AUTH_EMAIL}" =~ ^YOUR_ ]] \
+      && ! [[ "${AUTH_KEY}" =~ ^YOUR_ ]]; then
+    auth_ok=1
+  fi
+
+  if [[ "$auth_ok" -eq 0 ]]; then
+    local msg="No valid auth found in ${CONFIG_FILE}."
+    msg+=" Set 'auth_token' or 'auth_email'+'auth_key'."
+    _error "$msg"
+  fi
+}
+
+# ============================================================
+# build_auth_args
+#   Populates CURL_AUTH_ARGS for Cloudflare API requests.
+#   API Token auth is preferred; the legacy Global API Key is
+#   used as a fallback with a deprecation warning.
+#   Input:  none (reads AUTH_TOKEN or AUTH_EMAIL + AUTH_KEY)
+#   Output: CURL_AUTH_ARGS array populated
+#   Called by: load_config
+# ============================================================
+function build_auth_args() {
+  local ct="Content-Type: application/json"
+  if [[ -n "${AUTH_TOKEN:-}" ]]; then
+    CURL_AUTH_ARGS=(
+      "-H" "Authorization: Bearer ${AUTH_TOKEN}"
+      "-H" "$ct"
+    )
+  else
+    _warn "Using legacy API Key auth. Switch to an API Token."
+    CURL_AUTH_ARGS=(
+      "-H" "X-Auth-Email: ${AUTH_EMAIL}"
+      "-H" "X-Auth-Key: ${AUTH_KEY}"
+      "-H" "$ct"
+    )
+  fi
+}
+
+# ============================================================
+# load_config
+#   Parses the JSON config file (creating a template on first
+#   run), validates its contents, and builds the API auth args.
+#   Input:  none (reads CONFIG_FILE global)
+#   Output: AUTH_TOKEN/EMAIL/KEY, ZONE_NAME, RECORD_NAME,
+#           IP_CHECK_URL globals set; CURL_AUTH_ARGS built
+#   Called by: main
+# ============================================================
+function load_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    create_config_template
+    _warn "No config found. Template created at ${CONFIG_FILE}."
+    _warn "Fill in your values, then re-run ${SCRIPT_NAME}."
+    exit 1
+  fi
+
+  chmod 600 "$CONFIG_FILE"
+
+  if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+    _error "Config file contains invalid JSON: ${CONFIG_FILE}"
+  fi
+
+  AUTH_TOKEN=$(jq -r '.auth_token  // empty' "$CONFIG_FILE")
+  AUTH_EMAIL=$(jq -r '.auth_email  // empty' "$CONFIG_FILE")
+  AUTH_KEY=$(jq -r   '.auth_key    // empty' "$CONFIG_FILE")
+  ZONE_NAME=$(jq -r  '.zone_name   // empty' "$CONFIG_FILE")
+  RECORD_NAME=$(jq -r '.record_name // empty' "$CONFIG_FILE")
+  IP_CHECK_URL=$(jq -r '.ip_check_url // empty' "$CONFIG_FILE")
+
+  validate_config
+  build_auth_args
+}
+
+# ============================================================
+# cloudflare_api_call
+#   Sends a request to the Cloudflare API and prints the JSON
+#   response body. Exits on network-level failure.
+#   Input:  $1 - HTTP method (GET, PATCH, …)
+#           $2 - API endpoint path (/client/v4/…)
+#           $3 - optional JSON request body
+#   Output: API response JSON to stdout
+#   Called by: fetch_identifiers, get_current_dns_ip,
+#              update_dns_record
+# ============================================================
+function cloudflare_api_call() {
+  local method="$1"
+  local endpoint="$2"
+  local data="${3:-}"
+  local response
+
+  local -a curl_args=(
+    "--silent"
+    "--connect-timeout" "10"
+    "--max-time" "30"
+    "--request" "$method"
+    "https://api.cloudflare.com${endpoint}"
+    "${CURL_AUTH_ARGS[@]}"
+  )
+
+  [[ -n "$data" ]] && curl_args+=("--data" "$data")
+
+  response=$(curl "${curl_args[@]}") || {
+    _error "Network error calling Cloudflare API (${method} ${endpoint})."
+  }
+  printf '%s' "$response"
+}
+
+# ============================================================
+# check_api_response
+#   Validates a Cloudflare API JSON response. Extracts and
+#   reports API error messages when success is not true.
+#   Input:  $1 - human-readable context label
+#           $2 - raw JSON response string
+#   Output: exits with error on failure
+#   Called by: fetch_identifiers, get_current_dns_ip,
+#              update_dns_record
+# ============================================================
+function check_api_response() {
+  local context="$1"
+  local response="$2"
+
+  if [[ -z "$response" ]]; then
+    _error "${context}: empty response from Cloudflare API."
+  fi
+
+  local success
+  success=$(printf '%s' "$response" | jq -r '.success // false')
+
+  if [[ "$success" != "true" ]]; then
+    local api_errors
+    api_errors=$(printf '%s' "$response" \
+      | jq -r \
+        '[.errors[] | "\(.code): \(.message)"] | join("; ")' \
+      2>/dev/null) || api_errors="(could not parse errors)"
+    _error "${context} failed: ${api_errors}"
+  fi
+}
+
+# ============================================================
+# fetch_identifiers
+#   Retrieves zone and record identifiers from the Cloudflare
+#   API and caches them in ID_FILE (mode 600).
+#   Input:  none (reads ZONE_NAME, RECORD_NAME globals)
+#   Output: ZONE_IDENTIFIER and RECORD_IDENTIFIER set;
+#           ID_FILE written with mode 600
+#   Called by: load_or_fetch_identifiers
+# ============================================================
+function fetch_identifiers() {
+  local response zone_id record_id
+
+  response=$(cloudflare_api_call "GET" \
+    "/client/v4/zones?name=${ZONE_NAME}")
+  check_api_response "Zone lookup" "$response"
+  zone_id=$(printf '%s' "$response" \
+    | jq -r '.result[0].id // empty')
+  if [[ ${#zone_id} -ne 32 ]]; then
+    _error "Zone '${ZONE_NAME}' not found in your account."
+  fi
+
+  response=$(cloudflare_api_call "GET" \
+    "/client/v4/zones/${zone_id}/dns_records?name=${RECORD_NAME}")
+  check_api_response "DNS record lookup" "$response"
+  record_id=$(printf '%s' "$response" \
+    | jq -r '.result[0].id // empty')
+  if [[ ${#record_id} -ne 32 ]]; then
+    _error "Record '${RECORD_NAME}' not found in '${ZONE_NAME}'."
+  fi
+
+  ZONE_IDENTIFIER="$zone_id"
+  RECORD_IDENTIFIER="$record_id"
+  printf 'ZONE_IDENTIFIER=%s\nRECORD_IDENTIFIER=%s\n' \
+    "$zone_id" "$record_id" > "$ID_FILE"
+  chmod 600 "$ID_FILE"
+}
+
+# ============================================================
+# load_or_fetch_identifiers
+#   Loads cached zone/record IDs from ID_FILE, or fetches them
+#   from the Cloudflare API when the cache is absent or
+#   incomplete.
+#   Input:  none
+#   Output: ZONE_IDENTIFIER and RECORD_IDENTIFIER set
+#   Called by: main
+# ============================================================
+function load_or_fetch_identifiers() {
+  if [[ -f "$ID_FILE" ]]; then
+    local key value
+    while IFS='=' read -r key value; do
+      case "$key" in
+        ZONE_IDENTIFIER)   ZONE_IDENTIFIER="$value"   ;;
+        RECORD_IDENTIFIER) RECORD_IDENTIFIER="$value" ;;
+      esac
+    done < "$ID_FILE"
+  fi
+
+  if [[ ${#ZONE_IDENTIFIER} -eq 32 \
+      && ${#RECORD_IDENTIFIER} -eq 32 ]]; then
+    return 0
+  fi
+
+  _warn "ID cache missing or incomplete; fetching from API."
+  fetch_identifiers
+}
+
+# ============================================================
+# get_current_dns_ip
+#   Retrieves the content (IP address) of the DNS A record
+#   currently stored in Cloudflare for RECORD_NAME.
+#   Input:  none
+#   Output: current IP string to stdout
+#   Called by: check_for_ip_change
+# ============================================================
+function get_current_dns_ip() {
+  local response current_ip endpoint
+  endpoint="/client/v4/zones/${ZONE_IDENTIFIER}"
+  endpoint+="/dns_records/${RECORD_IDENTIFIER}"
+  response=$(cloudflare_api_call "GET" "$endpoint")
+  check_api_response "Current record fetch" "$response"
+  current_ip=$(printf '%s' "$response" \
+    | jq -r '.result.content // empty')
+  printf '%s' "$current_ip"
+}
+
+# ============================================================
+# update_dns_record
+#   Updates the Cloudflare A record for RECORD_NAME using PATCH
+#   so that other record fields (proxied, TTL) are preserved.
+#   In dry-run mode the PATCH is skipped and the intended
+#   change is logged instead.
+#   Input:  $1 - new IP address
+#           $2 - previous IP address (for the log message)
+#   Output: DNS record updated (or dry-run message) and logged
+#   Called by: check_for_ip_change
+# ============================================================
+function update_dns_record() {
+  local new_ip="$1"
+  local old_ip="$2"
+  local response endpoint
+  endpoint="/client/v4/zones/${ZONE_IDENTIFIER}"
+  endpoint+="/dns_records/${RECORD_IDENTIFIER}"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    _info "[DRY-RUN] Would update ${RECORD_NAME}: ${old_ip} -> ${new_ip}"
+    return 0
+  fi
+
+  response=$(cloudflare_api_call "PATCH" "$endpoint" \
+    "{\"content\":\"${new_ip}\"}")
+  check_api_response "DNS record update" "$response"
+  _info "${RECORD_NAME}: ${old_ip} -> ${new_ip}"
+}
+
+# ============================================================
+# check_for_ip_change
+#   Fetches the current public IP and compares it with the
+#   value stored in Cloudflare. Updates the DNS record if
+#   they differ. In dry-run mode, logs the outcome without
+#   making any changes.
+#   Input:  none
+#   Output: DNS record updated (or dry-run message) if changed;
+#           dry-run no-change message when IPs already match
+#   Called by: main
+# ============================================================
+function check_for_ip_change() {
+  local new_ip old_ip
+
+  new_ip=$(curl --silent \
+    --connect-timeout 5 --max-time 10 \
+    --retry 3 --retry-delay 3 \
+    "$IP_CHECK_URL") || {
+    _error "Failed to get public IP from ${IP_CHECK_URL}."
+  }
+
+  if ! _valid_ip "$new_ip"; then
+    _error "Public IP check returned invalid value: '${new_ip}'."
+  fi
+
+  old_ip=$(get_current_dns_ip)
+  if [[ -z "$old_ip" ]] || ! _valid_ip "$old_ip"; then
+    _warn "Current DNS IP unreadable; forcing update."
+    update_dns_record "$new_ip" "unknown"
+    return 0
+  fi
+
+  if [[ "$new_ip" != "$old_ip" ]]; then
+    update_dns_record "$new_ip" "$old_ip"
+  elif [[ "$DRY_RUN" -eq 1 ]]; then
+    _info "[DRY-RUN] No change needed. ${RECORD_NAME} is already ${new_ip}"
+  fi
+}
+
+# ============================================================
+# main
+#   Entry point. Parses flags, then runs the DDNS update cycle.
+#   Input:  $@ - command line arguments
+#   Output: varies based on operation
+# ============================================================
+function main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        show_usage
+        exit 0
+        ;;
+      --version)
+        printf '%s %s\n' "$SCRIPT_NAME" "$VERSION"
+        exit 0
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      --no-color|--cron-mode)
+        USE_COLOR=0
+        ;;
+      --config)
+        if [[ $# -lt 2 || -z "${2:-}" ]]; then
+          _error "--config requires a file path argument."
+        fi
+        CONFIG_FILE="$2"
+        shift
+        ;;
+      --config=*)
+        CONFIG_FILE="${1#--config=}"
+        if [[ -z "$CONFIG_FILE" ]]; then
+          _error "--config= requires a file path argument."
+        fi
+        ;;
+      *)
+        printf 'Unknown option: %s\n' "$1" >&2
+        show_usage >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  check_dependencies
+  init_data_dir
+  load_config
+  acquire_lock
+  load_or_fetch_identifiers
+  check_for_ip_change
+}
+
+main "$@"
