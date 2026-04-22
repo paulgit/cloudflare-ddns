@@ -88,6 +88,13 @@ fi
 # after the config file is parsed.
 declare -a CURL_AUTH_ARGS=()
 
+# Check curl version once for retry support (requires 7.26.0+)
+CURL_SUPPORTS_RETRY=0
+if curl --version 2>/dev/null | head -1 \
+    | grep -qE '^(curl|libcurl) [7-9]\.' 2>/dev/null; then
+  CURL_SUPPORTS_RETRY=1
+fi
+
 # ============================================================
 # _color_text
 #   Applies an ANSI SGR sequence to text when colour is on.
@@ -290,13 +297,12 @@ function acquire_lock() {
 function _valid_ip() {
   local ip="$1"
   local stat=1
-  local regex='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'
-  if [[ $ip =~ $regex ]]; then
-    local -a ip_parts
-    IFS='.' read -ra ip_parts <<< "$ip"
-    [[ ${ip_parts[0]} -le 255 && ${ip_parts[1]} -le 255 \
-      && ${ip_parts[2]} -le 255 && ${ip_parts[3]} -le 255 ]]
-    stat=$?
+  local regex='^(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.'
+  regex+='(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.'
+  regex+='(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.'
+  regex+='(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
+  if [[ "$ip" =~ $regex ]]; then
+    stat=0
   fi
   return "$stat"
 }
@@ -310,8 +316,9 @@ function _valid_ip() {
 #   Called by: main
 # ============================================================
 function init_data_dir() {
-  [[ -d "$DATA_DIR" ]] || mkdir -m 700 "$DATA_DIR"
-  chmod 700 "$DATA_DIR"
+  if [[ ! -d "$DATA_DIR" ]]; then
+    umask 0077 && mkdir "$DATA_DIR"
+  fi
 }
 
 # ============================================================
@@ -416,7 +423,13 @@ function load_config() {
     exit 1
   fi
 
-  chmod 600 "$CONFIG_FILE"
+  local current_mode
+  current_mode=$(stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null \
+    || stat -c '%a' "$CONFIG_FILE" 2>/dev/null)
+  if [[ "$current_mode" != "600" ]]; then
+    _warn "Config file has insecure permissions ${current_mode}. Fixing to 600."
+    chmod 600 "$CONFIG_FILE"
+  fi
 
   if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
     _error "Config file contains invalid JSON: ${CONFIG_FILE}"
@@ -458,6 +471,11 @@ function cloudflare_api_call() {
     "https://api.cloudflare.com${endpoint}"
     "${CURL_AUTH_ARGS[@]}"
   )
+
+  if [[ "$CURL_SUPPORTS_RETRY" -eq 1 ]]; then
+    curl_args+=("--retry" "3")
+    curl_args+=("--retry-delay" "3")
+  fi
 
   [[ -n "$data" ]] && curl_args+=("--data" "$data")
 
@@ -530,8 +548,10 @@ function fetch_identifiers() {
 
   ZONE_IDENTIFIER="$zone_id"
   RECORD_IDENTIFIER="$record_id"
-  printf 'ZONE_IDENTIFIER=%s\nRECORD_IDENTIFIER=%s\n' \
-    "$zone_id" "$record_id" > "$ID_FILE"
+  {
+    printf 'ZONE_IDENTIFIER=%s\nRECORD_IDENTIFIER=%s\n' \
+      "$zone_id" "$record_id"
+  } > "$ID_FILE"
   chmod 600 "$ID_FILE"
 }
 
@@ -546,13 +566,30 @@ function fetch_identifiers() {
 # ============================================================
 function load_or_fetch_identifiers() {
   if [[ -f "$ID_FILE" ]]; then
-    local key value
+    local key value valid=true
     while IFS='=' read -r key value; do
       case "$key" in
-        ZONE_IDENTIFIER)   ZONE_IDENTIFIER="$value"   ;;
-        RECORD_IDENTIFIER) RECORD_IDENTIFIER="$value" ;;
+        ZONE_IDENTIFIER)
+          if [[ "$value" =~ ^[a-f0-9]{32}$ ]]; then
+            ZONE_IDENTIFIER="$value"
+          else
+            valid=false
+          fi
+          ;;
+        RECORD_IDENTIFIER)
+          if [[ "$value" =~ ^[a-f0-9]{32}$ ]]; then
+            RECORD_IDENTIFIER="$value"
+          else
+            valid=false
+          fi
+          ;;
       esac
     done < "$ID_FILE"
+    if [[ "$valid" != "true" ]]; then
+      _warn "ID cache corrupted; fetching from API."
+      ZONE_IDENTIFIER=""
+      RECORD_IDENTIFIER=""
+    fi
   fi
 
   if [[ ${#ZONE_IDENTIFIER} -eq 32 \
@@ -626,10 +663,18 @@ function update_dns_record() {
 function check_for_ip_change() {
   local new_ip old_ip
 
-  new_ip=$(curl --silent \
-    --connect-timeout 5 --max-time 10 \
-    --retry 3 --retry-delay 3 \
-    "$IP_CHECK_URL") || {
+  local -a curl_ip_args=(
+    "--silent"
+    "--connect-timeout" "5"
+    "--max-time" "10"
+    "$IP_CHECK_URL"
+  )
+  if [[ "$CURL_SUPPORTS_RETRY" -eq 1 ]]; then
+    curl_ip_args+=("--retry" "3")
+    curl_ip_args+=("--retry-delay" "3")
+  fi
+
+  new_ip=$(curl "${curl_ip_args[@]}") || {
     _error "Failed to get public IP from ${IP_CHECK_URL}."
   }
 
