@@ -1,4 +1,4 @@
-# Cloudflare Dynamic DNS &nbsp;![Version](https://img.shields.io/badge/version-2.2-blue)
+# Cloudflare Dynamic DNS &nbsp;![Version](https://img.shields.io/badge/version-2.3-blue)
 
 ## Introduction
 
@@ -116,7 +116,10 @@ Open it in your editor and fill in your values:
   "auth_token": "YOUR_CLOUDFLARE_API_TOKEN",
   "zone_name": "example.com",
   "record_name": "ddns.example.com",
-  "ip_check_url": "https://ipv4.icanhazip.com"
+  "ip_check_urls": [
+    "https://ipv4.icanhazip.com",
+    "https://api.ipify.org"
+  ]
 }
 ```
 
@@ -129,9 +132,19 @@ Open it in your editor and fill in your values:
 | `auth_key` | Yes* | Global API Key for legacy auth |
 | `zone_name` | Yes | The apex domain managed in Cloudflare (e.g. `example.com`) |
 | `record_name` | Yes | The A record to keep updated (e.g. `ddns.example.com`) |
-| `ip_check_url` | Yes | URL that returns the public IPv4 address as plain text |
+| `ip_check_urls` | Yes | Ordered array of URLs that return the public IPv4 address as plain text; the script tries each in sequence until one succeeds |
 
 \* Provide either `auth_token` **or** both `auth_email` + `auth_key`.
+
+### Public IP URL fallback behavior
+
+`ip_check_urls` is evaluated from top to bottom. If a URL is unreachable,
+times out, or returns an invalid value, the script automatically tries the
+next URL.
+
+For backward compatibility, existing configs that still use
+`ip_check_url` (single string) continue to work. A warning is emitted so you
+can migrate to `ip_check_urls` in your next config update.
 
 ### Authentication methods
 
@@ -151,7 +164,10 @@ can only edit DNS records in the zones you select.
   "auth_token": "your-api-token-here",
   "zone_name": "example.com",
   "record_name": "ddns.example.com",
-  "ip_check_url": "https://ipv4.icanhazip.com"
+  "ip_check_urls": [
+    "https://ipv4.icanhazip.com",
+    "https://api.ipify.org"
+  ]
 }
 ```
 
@@ -167,7 +183,10 @@ warning each time it runs.
   "auth_key": "your-global-api-key-here",
   "zone_name": "example.com",
   "record_name": "ddns.example.com",
-  "ip_check_url": "https://ipv4.icanhazip.com"
+  "ip_check_urls": [
+    "https://ipv4.icanhazip.com",
+    "https://api.ipify.org"
+  ]
 }
 ```
 

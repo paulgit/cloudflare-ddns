@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # cloudflare-ddns
-# Version: 2.2
+# Version: 2.3
 #
 # Uses Cloudflare as a Dynamic DNS provider to keep DNS records
 # automatically updated with the current public IP address.
@@ -53,7 +53,7 @@ IFS=$'\n\t'
 # ------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
-readonly VERSION="2.2"
+readonly VERSION="2.3"
 # Runtime data goes in a private home-directory subtree.
 readonly DATA_DIR="$HOME/.cloudflare-ddns"
 readonly ID_FILE="$DATA_DIR/cloudflare.ids"
@@ -71,6 +71,7 @@ CONFIG_FILE+="/cloudflare-ddns/cloudflare-ddns.json"
 
 ZONE_IDENTIFIER=""
 RECORD_IDENTIFIER=""
+IP_CHECK_URLS=()
 
 # Set to 1 by --dry-run; skips the DNS record update API call.
 DRY_RUN=0
@@ -349,7 +350,10 @@ function create_config_template() {
   "auth_token": "YOUR_CLOUDFLARE_API_TOKEN",
   "zone_name": "example.com",
   "record_name": "ddns.example.com",
-  "ip_check_url": "https://ipv4.icanhazip.com"
+  "ip_check_urls": [
+    "https://ipv4.icanhazip.com",
+    "https://api.ipify.org"
+  ]
 }
 EOF
   chmod 600 "$CONFIG_FILE"
@@ -365,10 +369,22 @@ EOF
 # ============================================================
 function validate_config() {
   local var json_key
-  for var in ZONE_NAME RECORD_NAME IP_CHECK_URL; do
+  for var in ZONE_NAME RECORD_NAME; do
     if [[ -z "${!var:-}" ]]; then
       json_key="${var,,}"
       _error "Required field '${json_key}' not set in ${CONFIG_FILE}."
+    fi
+  done
+
+  if [[ "${#IP_CHECK_URLS[@]}" -eq 0 ]]; then
+    _error \
+      "Required field 'ip_check_urls' not set in ${CONFIG_FILE}."
+  fi
+
+  local ip_check_url
+  for ip_check_url in "${IP_CHECK_URLS[@]}"; do
+    if [[ -z "$ip_check_url" ]]; then
+      _error "Field 'ip_check_urls' contains an empty URL."
     fi
   done
 
@@ -419,9 +435,11 @@ function build_auth_args() {
 # load_config
 #   Parses the JSON config file (creating a template on first
 #   run), validates its contents, and builds the API auth args.
+#   Supports both legacy 'ip_check_url' and new
+#   'ip_check_urls' formats.
 #   Input:  none (reads CONFIG_FILE global)
 #   Output: AUTH_TOKEN/EMAIL/KEY, ZONE_NAME, RECORD_NAME,
-#           IP_CHECK_URL globals set; CURL_AUTH_ARGS built
+#           IP_CHECK_URLS globals set; CURL_AUTH_ARGS built
 #   Called by: main
 # ============================================================
 function load_config() {
@@ -449,7 +467,24 @@ function load_config() {
   AUTH_KEY=$(jq -r   '.auth_key    // empty' "$CONFIG_FILE")
   ZONE_NAME=$(jq -r  '.zone_name   // empty' "$CONFIG_FILE")
   RECORD_NAME=$(jq -r '.record_name // empty' "$CONFIG_FILE")
-  IP_CHECK_URL=$(jq -r '.ip_check_url // empty' "$CONFIG_FILE")
+
+  mapfile -t IP_CHECK_URLS < <(
+    jq -r '
+      if (.ip_check_urls | type) == "array" then
+        .ip_check_urls[]? // empty
+      else
+        .ip_check_url // empty
+      end
+    ' "$CONFIG_FILE"
+  )
+
+  if jq -e '
+      (.ip_check_urls | type) != "array"
+      and (.ip_check_url // empty) != ""
+    ' "$CONFIG_FILE" >/dev/null 2>&1; then
+    _warn "Legacy config key 'ip_check_url' detected."
+    _warn "Please migrate to 'ip_check_urls' (array) per README."
+  fi
 
   validate_config
   build_auth_args
@@ -660,35 +695,46 @@ function update_dns_record() {
 
 # ============================================================
 # fetch_public_ip
-#   Fetches the current public IPv4 address from IP_CHECK_URL
-#   and validates the result before returning it.
+#   Fetches the current public IPv4 address using the ordered
+#   URLs from IP_CHECK_URLS. If one URL fails or returns an
+#   invalid value, the next URL is tried.
 #   Input:  none
 #   Output: validated public IP address to stdout
 #   Called by: check_for_ip_change, force_update_ip
 # ============================================================
 function fetch_public_ip() {
-  local new_ip
-  local -a curl_ip_args=(
-    "--silent"
-    "--connect-timeout" "5"
-    "--max-time" "10"
-    "$IP_CHECK_URL"
-  )
-  if [[ "$CURL_SUPPORTS_RETRY" -eq 1 ]]; then
-    curl_ip_args+=("--retry" "3")
-    curl_ip_args+=("--retry-delay" "3")
-  fi
+  local ip_check_url new_ip
+  local -a curl_ip_args
 
-  new_ip=$(curl "${curl_ip_args[@]}") || {
-    _error "Failed to get public IP from ${IP_CHECK_URL}."
-  }
+  for ip_check_url in "${IP_CHECK_URLS[@]}"; do
+    curl_ip_args=(
+      "--silent"
+      "--connect-timeout" "5"
+      "--max-time" "10"
+      "$ip_check_url"
+    )
+    if [[ "$CURL_SUPPORTS_RETRY" -eq 1 ]]; then
+      curl_ip_args+=("--retry" "3")
+      curl_ip_args+=("--retry-delay" "3")
+    fi
 
-  if ! _valid_ip "$new_ip"; then
-    _error \
-      "Public IP check returned invalid value: '${new_ip}'."
-  fi
+    if ! new_ip=$(curl "${curl_ip_args[@]}"); then
+      _warn "Failed to get public IP from ${ip_check_url}; trying next URL."
+      continue
+    fi
 
-  printf '%s' "$new_ip"
+    if ! _valid_ip "$new_ip"; then
+      _warn \
+        "Public IP check from ${ip_check_url} returned invalid value: '${new_ip}'."
+      continue
+    fi
+
+    printf '%s' "$new_ip"
+    return 0
+  done
+
+  _error \
+    "All configured IP check URLs failed. Check 'ip_check_urls' in ${CONFIG_FILE}."
 }
 
 # ============================================================
