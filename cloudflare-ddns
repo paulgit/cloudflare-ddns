@@ -53,7 +53,7 @@ IFS=$'\n\t'
 # ------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
-readonly VERSION="2.1"
+readonly VERSION="2.2"
 # Runtime data goes in a private home-directory subtree.
 readonly DATA_DIR="$HOME/.cloudflare-ddns"
 readonly ID_FILE="$DATA_DIR/cloudflare.ids"
