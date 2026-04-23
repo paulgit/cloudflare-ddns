@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # cloudflare-ddns
-# Version: 2.1
+# Version: 2.2
 #
 # Uses Cloudflare as a Dynamic DNS provider to keep DNS records
 # automatically updated with the current public IP address.
@@ -74,6 +74,10 @@ RECORD_IDENTIFIER=""
 
 # Set to 1 by --dry-run; skips the DNS record update API call.
 DRY_RUN=0
+
+# Set to 1 by --force; updates DNS without reading the current
+# DNS value first.
+FORCE_UPDATE=0
 
 # Colour output: enabled when stdout or stderr is a terminal
 # and the NO_COLOR convention (https://no-color.org/) is unset.
@@ -233,6 +237,10 @@ Options:
                           fetch public IP, read current DNS IP)
                           but do not apply any DNS changes.
                           Logs and prints what would have changed.
+  --force                 Skip the DNS value check and update the
+                          record immediately to the current public
+                          IP. Log output clearly states the update
+                          was forced. Compatible with --dry-run.
   --no-color, --cron-mode Disable coloured output. Colour is
                           also suppressed automatically when
                           not attached to a terminal or when
@@ -651,19 +659,15 @@ function update_dns_record() {
 }
 
 # ============================================================
-# check_for_ip_change
-#   Fetches the current public IP and compares it with the
-#   value stored in Cloudflare. Updates the DNS record if
-#   they differ. In dry-run mode, logs the outcome without
-#   making any changes.
+# fetch_public_ip
+#   Fetches the current public IPv4 address from IP_CHECK_URL
+#   and validates the result before returning it.
 #   Input:  none
-#   Output: DNS record updated (or dry-run message) if changed;
-#           dry-run no-change message when IPs already match
-#   Called by: main
+#   Output: validated public IP address to stdout
+#   Called by: check_for_ip_change, force_update_ip
 # ============================================================
-function check_for_ip_change() {
-  local new_ip old_ip
-
+function fetch_public_ip() {
+  local new_ip
   local -a curl_ip_args=(
     "--silent"
     "--connect-timeout" "5"
@@ -680,8 +684,28 @@ function check_for_ip_change() {
   }
 
   if ! _valid_ip "$new_ip"; then
-    _error "Public IP check returned invalid value: '${new_ip}'."
+    _error \
+      "Public IP check returned invalid value: '${new_ip}'."
   fi
+
+  printf '%s' "$new_ip"
+}
+
+# ============================================================
+# check_for_ip_change
+#   Fetches the current public IP and compares it with the
+#   value stored in Cloudflare. Updates the DNS record if
+#   they differ. In dry-run mode, logs the outcome without
+#   making any changes.
+#   Input:  none
+#   Output: DNS record updated (or dry-run message) if changed;
+#           no-change message when IPs already match (dry-run)
+#   Called by: main
+# ============================================================
+function check_for_ip_change() {
+  local new_ip old_ip
+
+  new_ip=$(fetch_public_ip)
 
   old_ip=$(get_current_dns_ip)
   if [[ -z "$old_ip" ]] || ! _valid_ip "$old_ip"; then
@@ -693,8 +717,40 @@ function check_for_ip_change() {
   if [[ "$new_ip" != "$old_ip" ]]; then
     update_dns_record "$new_ip" "$old_ip"
   elif [[ "$DRY_RUN" -eq 1 ]]; then
-    _info "[DRY-RUN] No change needed. ${RECORD_NAME} is already ${new_ip}"
+    _info \
+      "[DRY-RUN] No change needed. ${RECORD_NAME} is already ${new_ip}"
   fi
+}
+
+# ============================================================
+# force_update_ip
+#   Fetches the current public IP and unconditionally updates
+#   the Cloudflare DNS record, skipping the DNS value read.
+#   In dry-run mode the PATCH is skipped and the intended
+#   action is logged instead.
+#   Input:  none
+#   Output: DNS record updated (or dry-run message) and logged.
+#           Log clearly indicates the update was forced.
+#   Called by: main
+# ============================================================
+function force_update_ip() {
+  local new_ip endpoint response
+  new_ip=$(fetch_public_ip)
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    local msg="[DRY-RUN] [FORCED] Would update ${RECORD_NAME}"
+    msg+=" to ${new_ip} (DNS check skipped)"
+    _info "$msg"
+    return 0
+  fi
+
+  endpoint="/client/v4/zones/${ZONE_IDENTIFIER}"
+  endpoint+="/dns_records/${RECORD_IDENTIFIER}"
+  response=$(cloudflare_api_call "PATCH" "$endpoint" \
+    "{\"content\":\"${new_ip}\"}")
+  check_api_response "DNS record update" "$response"
+  _info \
+    "[FORCED] ${RECORD_NAME}: updated to ${new_ip} (DNS check skipped)"
 }
 
 # ============================================================
@@ -716,6 +772,9 @@ function main() {
         ;;
       --dry-run)
         DRY_RUN=1
+        ;;
+      --force)
+        FORCE_UPDATE=1
         ;;
       --no-color|--cron-mode)
         USE_COLOR=0
@@ -747,7 +806,11 @@ function main() {
   load_config
   acquire_lock
   load_or_fetch_identifiers
-  check_for_ip_change
+  if [[ "$FORCE_UPDATE" -eq 1 ]]; then
+    force_update_ip
+  else
+    check_for_ip_change
+  fi
 }
 
 main "$@"

@@ -1,4 +1,4 @@
-# Cloudflare Dynamic DNS &nbsp;![Version](https://img.shields.io/badge/version-2.1-blue)
+# Cloudflare Dynamic DNS &nbsp;![Version](https://img.shields.io/badge/version-2.2-blue)
 
 ## Introduction
 
@@ -188,6 +188,10 @@ Options:
                           fetch public IP, read current DNS IP)
                           but do not apply any DNS changes.
                           Logs and prints what would have changed.
+  --force                 Skip the DNS value check and update the
+                          record immediately to the current public
+                          IP. Log output clearly states the update
+                          was forced. Compatible with --dry-run.
   --no-color, --cron-mode Disable coloured output. Colour is
                           also suppressed automatically when
                           not attached to a terminal or when
@@ -206,6 +210,19 @@ Check what would happen without making any changes:
 
 ```shell
 ./cloudflare-ddns --dry-run
+```
+
+Force an immediate DNS update, skipping the current value check:
+
+```shell
+./cloudflare-ddns --force
+```
+
+Combine `--force` with `--dry-run` to see what a forced update would do
+without actually applying it:
+
+```shell
+./cloudflare-ddns --force --dry-run
 ```
 
 Combine with a custom config and no colour:
@@ -252,6 +269,14 @@ the script is invoked from cron. Example entries:
 2024-06-01T08:00:01Z [INFO] ddns.example.com: 1.2.3.4 -> 5.6.7.8
 2024-06-01T08:05:01Z [WARN] ID cache missing or incomplete; fetching from API.
 2024-06-01T09:10:01Z [ERROR] Public IP check returned invalid value: ''.
+2024-06-01T10:00:01Z [INFO] [FORCED] ddns.example.com: updated to 5.6.7.8 (DNS check skipped)
+```
+
+When `--dry-run` and `--force` are combined, the entry is prefixed with both
+labels:
+
+```
+2024-06-01T10:00:01Z [INFO] [DRY-RUN] [FORCED] Would update ddns.example.com to 5.6.7.8 (DNS check skipped)
 ```
 
 ---
@@ -286,6 +311,10 @@ The script produces **no output** when the IP address has not changed, so cron
 will not send mail on the majority of runs. Output (and therefore mail) is
 only generated when the record is updated, a warning is raised, or an error
 occurs.
+
+> **Note:** When `--force` is used, the DNS record is always updated and
+> output is always produced, regardless of whether the IP has changed. Avoid
+> using `--force` in cron unless you specifically want this behaviour.
 
 ---
 
@@ -336,6 +365,7 @@ terminal (TTY). It is suppressed in any of the following cases:
 | `Another instance is already running` | A previous run is still active; or the lock was left behind — remove `/tmp/cloudflare-ddns-<uid>.lock` |
 | `Failed to get public IP` | The `ip_check_url` is unreachable; try `curl https://ipv4.icanhazip.com` manually |
 | DNS record keeps updating unexpectedly | Run with `--dry-run` to inspect what public IP and DNS IP are being detected without making changes |
+| Need to force an update regardless of current DNS value | Use `--force` to skip the DNS value check and update immediately; combine with `--dry-run` to preview the action first |
 
 ---
 
