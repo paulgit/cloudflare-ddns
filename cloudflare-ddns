@@ -355,7 +355,9 @@ function create_config_template() {
   [[ -d "$config_dir" ]] || mkdir -p "$config_dir"
   chmod 700 "$config_dir"
 
-  cat > "$CONFIG_FILE" <<'EOF'
+  (
+    umask 0077
+    cat > "$CONFIG_FILE" <<'EOF'
 {
   "auth_token": "YOUR_CLOUDFLARE_API_TOKEN",
   "zone_name": "example.com",
@@ -366,6 +368,7 @@ function create_config_template() {
   ]
 }
 EOF
+  )
   chmod 600 "$CONFIG_FILE"
 }
 
