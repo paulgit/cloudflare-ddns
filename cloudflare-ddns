@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # cloudflare-ddns
-# Version: 2.3
+# Version: 2.4
 #
 # Uses Cloudflare as a Dynamic DNS provider to keep DNS records
 # automatically updated with the current public IP address.
@@ -53,7 +53,7 @@ IFS=$'\n\t'
 # ------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
-readonly VERSION="2.3"
+readonly VERSION="2.4"
 # Runtime data goes in a private home-directory subtree.
 readonly DATA_DIR="$HOME/.cloudflare-ddns"
 readonly ID_FILE="$DATA_DIR/cloudflare.ids"
