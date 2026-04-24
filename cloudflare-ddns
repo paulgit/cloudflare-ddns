@@ -69,6 +69,9 @@ readonly LOCK_FILE
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_FILE+="/cloudflare-ddns/cloudflare-ddns.json"
 
+# Maximum log file size in bytes before rotation (1 MiB).
+readonly MAX_LOG_SIZE_IN_BYTES=1048576
+
 ZONE_IDENTIFIER=""
 RECORD_IDENTIFIER=""
 IP_CHECK_URLS=()
@@ -95,9 +98,13 @@ declare -a CURL_AUTH_ARGS=()
 
 # Check curl version once for retry support (requires 7.26.0+)
 CURL_SUPPORTS_RETRY=0
-if curl --version 2>/dev/null | head -1 \
-    | grep -qE '^(curl|libcurl) [7-9]\.' 2>/dev/null; then
-  CURL_SUPPORTS_RETRY=1
+CURL_VERSION=""
+if command -v curl &>/dev/null; then
+  CURL_VERSION=$(curl --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [[ -n "$CURL_VERSION" ]] \
+      && [[ "$(printf '%s\n' '7.26.0' "$CURL_VERSION" | sort -V | head -1)" == '7.26.0' ]]; then
+    CURL_SUPPORTS_RETRY=1
+  fi
 fi
 
 # ============================================================
@@ -153,6 +160,18 @@ function _yellow() {
 function _log_to_file() {
   local level="$1"
   local message="$2"
+  local log_size=0
+
+  if [[ -f "$LOG_FILE" ]]; then
+    log_size=$(stat -f%z "$LOG_FILE" 2>/dev/null \
+      || stat -c%s "$LOG_FILE" 2>/dev/null \
+      || printf '0')
+  fi
+
+  if [[ "$log_size" -gt "$MAX_LOG_SIZE_IN_BYTES" ]]; then
+    mv -f "$LOG_FILE" "${LOG_FILE}.old" 2>/dev/null || true
+  fi
+
   printf '%s [%s] %s\n' \
     "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$level" "$message" \
     >> "$LOG_FILE" 2>/dev/null || true
