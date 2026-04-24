@@ -289,9 +289,19 @@ trap cleanup EXIT ERR
 function acquire_lock() {
   if ! mkdir "$LOCK_FILE" 2>/dev/null; then
     local lock_pid="unknown"
-    [[ -f "$LOCK_FILE/pid" ]] \
-      && lock_pid=$(cat "$LOCK_FILE/pid")
-    _error "Another instance is already running (PID: ${lock_pid})."
+    if [[ -f "$LOCK_FILE/pid" ]]; then
+      lock_pid=$(cat "$LOCK_FILE/pid")
+      if kill -0 "$lock_pid" 2>/dev/null; then
+        _error "Another instance is already running (PID: ${lock_pid})."
+      else
+        _warn "Removing stale lock from dead PID ${lock_pid}."
+        rm -rf "$LOCK_FILE"
+        mkdir "$LOCK_FILE" 2>/dev/null \
+          || _error "Failed to create lock directory after removing stale lock."
+      fi
+    else
+      _error "Lock directory exists but contains no PID file."
+    fi
   fi
   printf '%s\n' "$$" > "$LOCK_FILE/pid"
 }
