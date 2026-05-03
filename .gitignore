@@ -1,2 +1,83 @@
+# ============================================================
+# .gitignore — cloudflare-ddns
+# ============================================================
+
+# ------------------------------------------------------------
+# Script runtime files (if running from a checkout)
+# ------------------------------------------------------------
 cloudflare.ids
+cloudflare.log
+cloudflare.log.old
 cloudflare-ddns.conf
+*.lock
+
+# ------------------------------------------------------------
+# OS
+# ------------------------------------------------------------
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# ------------------------------------------------------------
+# Editors
+# ------------------------------------------------------------
+
+# Vim
+*.swp
+*.swo
+*.swn
+Session.vim
+.netrwhist
+
+# Emacs
+\#*\#
+.#*
+
+# VS Code
+.vscode/
+
+# JetBrains (IntelliJ, PyCharm, etc.)
+.idea/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# TextMate
+*.tmproj
+*.tmproject
+
+# Nano
+*.save
+
+# ------------------------------------------------------------
+# AI agents
+# ------------------------------------------------------------
+.claude/
+.cursor/
+.aider/
+.aider.chat.history.md
+.aider.input.history
+.copilot/
+.continue/
+.codeium/
+.windsurf/
+.roo/
+.cline/
+.qodo/
+.augment/
+.gemini/
+.mentat/
+.amp/
