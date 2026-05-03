@@ -40,22 +40,30 @@ sudo apt install curl jq
 
 ### Quick install (recommended)
 
-Download the script directly into `/usr/local/bin` and make it executable
-in one step:
+Download the script into `~/.local/bin` and make it executable in one step.
+No `sudo` is required:
 
 ```shell
-sudo curl -fsSL \
-  https://raw.githubusercontent.com/paulgit/cloudflare-ddns/master/cloudflare-ddns \
-  -o /usr/local/bin/cloudflare-ddns \
-  && sudo chmod +x /usr/local/bin/cloudflare-ddns
+mkdir -p ~/.local/bin \
+  && curl -fsSL \
+    https://raw.githubusercontent.com/paulgit/cloudflare-ddns/master/cloudflare-ddns \
+    -o ~/.local/bin/cloudflare-ddns \
+  && chmod +x ~/.local/bin/cloudflare-ddns
 ```
-
-Once installed, the script is available system-wide as `cloudflare-ddns`.
 
 > **Note:** Inspect the script before running it if you prefer:
 > ```shell
 > curl -fsSL https://raw.githubusercontent.com/paulgit/cloudflare-ddns/master/cloudflare-ddns | less
 > ```
+
+`~/.local/bin` is on `$PATH` by default on most modern Linux distributions
+(Ubuntu 20.04+, Fedora, Arch, Raspberry Pi OS). If `cloudflare-ddns` is not
+found after installation, add the directory to your shell profile:
+
+```shell
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
 
 ### Install from source
 
@@ -63,15 +71,17 @@ Clone the repository and symlink (or copy) the script into your `PATH`:
 
 ```shell
 git clone https://github.com/paulgit/cloudflare-ddns.git
-sudo ln -s "$(pwd)/cloudflare-ddns/cloudflare-ddns" /usr/local/bin/cloudflare-ddns
+mkdir -p ~/.local/bin
+ln -s "$(pwd)/cloudflare-ddns/cloudflare-ddns" ~/.local/bin/cloudflare-ddns
 ```
 
 Or copy it instead of symlinking:
 
 ```shell
 git clone https://github.com/paulgit/cloudflare-ddns.git
-sudo cp cloudflare-ddns/cloudflare-ddns /usr/local/bin/cloudflare-ddns
-sudo chmod +x /usr/local/bin/cloudflare-ddns
+mkdir -p ~/.local/bin
+cp cloudflare-ddns/cloudflare-ddns ~/.local/bin/cloudflare-ddns
+chmod +x ~/.local/bin/cloudflare-ddns
 ```
 
 ### Verify the installation
@@ -310,7 +320,7 @@ crontab -e
 ```
 
 ```
-*/5 * * * * /path/to/cloudflare-ddns --cron-mode
+*/5 * * * * ~/.local/bin/cloudflare-ddns --cron-mode
 ```
 
 The `--cron-mode` flag (equivalent to `--no-color`) prevents ANSI colour
@@ -318,10 +328,14 @@ escape codes from appearing in cron mail. Colour is also disabled
 automatically when the script detects it is not attached to a terminal, so
 the flag is optional but recommended for clarity.
 
+> **Note:** cron does not expand `~` in command paths on all systems. Use the
+> full path (`/home/youruser/.local/bin/cloudflare-ddns`) or the `$HOME`
+> variable if `~` does not work in your crontab.
+
 If you use a non-default config location, pass `--config` as well:
 
-```shell
-*/5 * * * * /path/to/cloudflare-ddns --cron-mode --config /etc/cloudflare-ddns/config.json
+```
+*/5 * * * * ~/.local/bin/cloudflare-ddns --cron-mode --config ~/.config/cloudflare-ddns/alt.json
 ```
 
 ### Suppressing cron mail on no-change runs
