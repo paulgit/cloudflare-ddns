@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # cloudflare-ddns
-# Version: 2.5
+# Version: 2.6
 #
 # Uses Cloudflare as a Dynamic DNS provider to keep DNS records
 # automatically updated with the current public IP address.
@@ -54,7 +54,7 @@ IFS=$'\n\t'
 # ------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
-readonly VERSION="2.5"
+readonly VERSION="2.6"
 # Runtime data follows the XDG Base Directory Specification
 # (XDG_STATE_HOME, defaulting to ~/.local/state).
 readonly DATA_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cloudflare-ddns"
@@ -359,7 +359,7 @@ function _valid_ip() {
 # ============================================================
 function init_data_dir() {
   if [[ ! -d "$DATA_DIR" ]]; then
-    umask 0077 && mkdir "$DATA_DIR"
+    umask 0077 && mkdir -p "$DATA_DIR"
   fi
 }
 
