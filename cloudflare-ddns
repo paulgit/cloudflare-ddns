@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # cloudflare-ddns
-# Version: 2.4
+# Version: 2.5
 #
 # Uses Cloudflare as a Dynamic DNS provider to keep DNS records
 # automatically updated with the current public IP address.
@@ -14,7 +14,8 @@
 #    ~/.config/cloudflare-ddns/cloudflare-ddns.json (respects
 #    $XDG_CONFIG_HOME). Override with --config PATH.
 #  - Runtime data (cached IDs, log, lock) go in
-#    ~/.cloudflare-ddns — user-private, outside any repo tree.
+#    ${XDG_STATE_HOME}/cloudflare-ddns (default ~/.local/state)
+#    following the XDG Base Directory Specification.
 #  - Current DNS IP source: Cloudflare API rather than a dig
 #    query, eliminating DNS propagation lag and the dig
 #    dependency.
@@ -53,9 +54,10 @@ IFS=$'\n\t'
 # ------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
-readonly VERSION="2.4"
-# Runtime data goes in a private home-directory subtree.
-readonly DATA_DIR="$HOME/.cloudflare-ddns"
+readonly VERSION="2.5"
+# Runtime data follows the XDG Base Directory Specification
+# (XDG_STATE_HOME, defaulting to ~/.local/state).
+readonly DATA_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cloudflare-ddns"
 readonly ID_FILE="$DATA_DIR/cloudflare.ids"
 readonly LOG_FILE="$DATA_DIR/cloudflare.log"
 # Per-user lock allows different users to run simultaneously.
@@ -259,8 +261,9 @@ Options:
                           Logs and prints what would have changed.
   --force                 Skip the DNS value check and update the
                           record immediately to the current public
-                          IP. Log output clearly states the update
-                          was forced. Compatible with --dry-run.
+                          IP. Also refreshes cached zone/record
+                          identifiers from the API. Compatible with
+                          --dry-run.
   --no-color, --cron-mode Disable coloured output. Colour is
                           also suppressed automatically when
                           not attached to a terminal or when
@@ -883,6 +886,13 @@ function main() {
   init_data_dir
   load_config
   acquire_lock
+
+  # When --force is used, discard the cached identifiers so they
+  # are re-fetched from the API (handles zone/record renames).
+  if [[ "$FORCE_UPDATE" -eq 1 ]] && [[ -f "$ID_FILE" ]]; then
+    rm -f "$ID_FILE"
+  fi
+
   load_or_fetch_identifiers
   if [[ "$FORCE_UPDATE" -eq 1 ]]; then
     force_update_ip
