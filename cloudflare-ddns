@@ -366,7 +366,7 @@ function _url_encode() {
     local char="${string:$position:1}"
     case "$char" in
       [a-zA-Z0-9.~_-]) encoded+="$char" ;;
-      *) printf '%%%02X' "$char" ;;
+      *) printf '%%%02X' "'$char" ;;
     esac
   done
   printf '%s' "$encoded"
@@ -782,16 +782,16 @@ function fetch_public_ip() {
       curl_ip_args+=("--retry-delay" "3")
     fi
 
-  local curl_stderr
-  curl_stderr=$(mktemp)
-  if ! new_ip=$(curl "${curl_ip_args[@]}" 2>"$curl_stderr"); then
-    local detail
-    detail=$(head -1 "$curl_stderr" 2>/dev/null)
+    local curl_stderr
+    curl_stderr=$(mktemp)
+    if ! new_ip=$(curl "${curl_ip_args[@]}" 2>"$curl_stderr"); then
+      local detail
+      detail=$(head -1 "$curl_stderr" 2>/dev/null)
+      rm -f "$curl_stderr"
+      _warn "Failed to get public IP from ${ip_check_url}: ${detail:-unknown}; trying next URL."
+      continue
+    fi
     rm -f "$curl_stderr"
-    _warn "Failed to get public IP from ${ip_check_url}: ${detail:-unknown}; trying next URL."
-    continue
-  fi
-  rm -f "$curl_stderr"
 
     if ! _valid_ip "$new_ip"; then
       _warn \
