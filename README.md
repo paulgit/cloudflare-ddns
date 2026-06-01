@@ -274,10 +274,10 @@ The script stores runtime data separately from the configuration:
 
 | Path | Purpose |
 |------|---------|
-| `~/.cloudflare-ddns/cloudflare.ids` | Cached Cloudflare zone and record identifiers |
-| `~/.cloudflare-ddns/cloudflare.log` | Timestamped log of all INFO / WARN / ERROR events |
+| `~/.local/state/cloudflare-ddns/cloudflare.ids` | Cached Cloudflare zone and record identifiers |
+| `~/.local/state/cloudflare-ddns/cloudflare.log` | Timestamped log of all INFO / WARN / ERROR events |
 
-The `~/.cloudflare-ddns/` directory is created automatically with permissions
+The `~/.local/state/cloudflare-ddns/` directory is created automatically with permissions
 `700` on first run.
 
 ### Identifier cache
@@ -377,7 +377,7 @@ terminal (TTY). It is suppressed in any of the following cases:
 - The config file and identifier cache are both created and maintained with
   permissions `600` (owner read/write only).
 - The config directory (`~/.config/cloudflare-ddns/`) and data directory
-  (`~/.cloudflare-ddns/`) are maintained with permissions `700`.
+  (`~/.local/state/cloudflare-ddns/`) are maintained with permissions `700`.
 - The config file is parsed as JSON via `jq` — it is never executed as shell
   code.
 - API credentials are never written to the log file.
