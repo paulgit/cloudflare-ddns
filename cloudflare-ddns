@@ -350,6 +350,29 @@ function _valid_ip() {
 }
 
 # ============================================================
+# _url_encode
+#   Percent-encodes a string for safe inclusion in a URL query
+#   parameter. Leaves alphanumerics and -_.~ unchanged.
+#   Input:  $1 - string to encode
+#   Output: percent-encoded string to stdout
+#   Called by: fetch_identifiers
+# ============================================================
+function _url_encode() {
+  local string="${1}"
+  local length=${#string}
+  local encoded=""
+  local position
+  for (( position=0; position<length; position++ )); do
+    local char="${string:$position:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-]) encoded+="$char" ;;
+      *) printf '%%%02X' "'$char" ;;
+    esac
+  done
+  printf '%s' "$encoded"
+}
+
+# ============================================================
 # init_data_dir
 #   Creates the runtime data directory with strict permissions
 #   if it does not already exist, then enforces mode 700.
@@ -487,7 +510,7 @@ function load_config() {
 
   local current_mode
   current_mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null \
-    || stat -f '%OLp' "$CONFIG_FILE" 2>/dev/null)
+    || printf '000')
   if [[ "$current_mode" != "600" ]]; then
     _warn "Config file has insecure permissions ${current_mode}. Fixing to 600."
     chmod 600 "$CONFIG_FILE"
@@ -558,9 +581,15 @@ function cloudflare_api_call() {
 
   [[ -n "$data" ]] && curl_args+=("--data" "$data")
 
-  response=$(curl "${curl_args[@]}") || {
-    _error "Network error calling Cloudflare API (${method} ${endpoint})."
+  local curl_stderr
+  curl_stderr=$(mktemp)
+  response=$(curl "${curl_args[@]}" 2>"$curl_stderr") || {
+    local detail
+    detail=$(head -1 "$curl_stderr" 2>/dev/null)
+    rm -f "$curl_stderr"
+    _error "Network error calling Cloudflare API (${method} ${endpoint}): ${detail:-unknown}"
   }
+  rm -f "$curl_stderr"
   printf '%s' "$response"
 }
 
@@ -608,7 +637,7 @@ function fetch_identifiers() {
   local response zone_id record_id
 
   response=$(cloudflare_api_call "GET" \
-    "/client/v4/zones?name=${ZONE_NAME}")
+    "/client/v4/zones?name=$(_url_encode "${ZONE_NAME}")")
   check_api_response "Zone lookup" "$response"
   zone_id=$(printf '%s' "$response" \
     | jq -r '.result[0].id // empty')
@@ -617,7 +646,7 @@ function fetch_identifiers() {
   fi
 
   response=$(cloudflare_api_call "GET" \
-    "/client/v4/zones/${zone_id}/dns_records?name=${RECORD_NAME}")
+    "/client/v4/zones/${zone_id}/dns_records?name=$(_url_encode "${RECORD_NAME}")")
   check_api_response "DNS record lookup" "$response"
   record_id=$(printf '%s' "$response" \
     | jq -r '.result[0].id // empty')
@@ -753,10 +782,16 @@ function fetch_public_ip() {
       curl_ip_args+=("--retry-delay" "3")
     fi
 
-    if ! new_ip=$(curl "${curl_ip_args[@]}"); then
-      _warn "Failed to get public IP from ${ip_check_url}; trying next URL."
+    local curl_stderr
+    curl_stderr=$(mktemp)
+    if ! new_ip=$(curl "${curl_ip_args[@]}" 2>"$curl_stderr"); then
+      local detail
+      detail=$(head -1 "$curl_stderr" 2>/dev/null)
+      rm -f "$curl_stderr"
+      _warn "Failed to get public IP from ${ip_check_url}: ${detail:-unknown}; trying next URL."
       continue
     fi
+    rm -f "$curl_stderr"
 
     if ! _valid_ip "$new_ip"; then
       _warn \
