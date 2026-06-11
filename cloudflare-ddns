@@ -337,6 +337,13 @@ trap cleanup EXIT ERR
 # ============================================================
 function acquire_lock() {
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    # A competitor may have created the lock a moment ago and
+    # not yet written its pid file. Wait briefly before
+    # concluding the lock is stale, so we don't destroy a live
+    # lock that is still being set up.
+    if [[ ! -f "$LOCK_DIR/pid" ]]; then
+      sleep 2
+    fi
     local lock_pid=""
     if [[ -f "$LOCK_DIR/pid" ]]; then
       lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null) || lock_pid=""
@@ -363,10 +370,10 @@ function acquire_lock() {
 # ============================================================
 # _valid_ip
 #   Validates whether a string is a valid IPv4 address. The
-#   raw value is matched as-is (no whitespace stripping), so a
+#   value is matched as-is (no whitespace stripping), so a
 #   value that passes is safe to embed in the API JSON body.
-#   Trailing newlines from curl are already removed by the
-#   caller's command substitution.
+#   Callers must trim surrounding whitespace beforehand and
+#   then use the same trimmed value they validated.
 #   Input:  $1 - string to validate
 #   Output: returns 0 if valid, 1 if invalid
 #   Called by: check_for_ip_change, fetch_public_ip
@@ -863,6 +870,14 @@ function fetch_public_ip() {
     fi
     rm -f "$curl_stderr_file"
     curl_stderr_file=""
+
+    # HTTP endpoints may end the body with CRLF; command
+    # substitution strips the trailing newline but not the
+    # carriage return. Trim surrounding whitespace, then
+    # validate and use that same trimmed value. Embedded
+    # whitespace still fails validation.
+    new_ip="${new_ip#"${new_ip%%[![:space:]]*}"}"
+    new_ip="${new_ip%"${new_ip##*[![:space:]]}"}"
 
     if ! _valid_ip "$new_ip"; then
       local invalid_msg="Public IP check from ${ip_check_url}"
