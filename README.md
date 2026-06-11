@@ -1,4 +1,4 @@
-# Cloudflare Dynamic DNS &nbsp;![Version](https://img.shields.io/badge/version-2.6-blue)
+# Cloudflare Dynamic DNS &nbsp;![Version](https://img.shields.io/badge/version-2.7-blue)
 
 ## Introduction
 
@@ -353,11 +353,13 @@ occurs.
 
 ## Concurrency Protection
 
-A per-user lock directory is created at `/tmp/cloudflare-ddns-<uid>.lock`
+A lock directory is created at
+`~/.local/state/cloudflare-ddns/lock` (respecting `$XDG_STATE_HOME`)
 before any network activity begins. This prevents two cron instances from
 running simultaneously if a previous invocation is still in progress (e.g.
 due to a slow network). The lock is removed automatically on exit, including
-on error.
+on error, and a stale lock left behind by a killed process is detected and
+recovered on the next run.
 
 ---
 
@@ -395,7 +397,7 @@ terminal (TTY). It is suppressed in any of the following cases:
 | `No valid auth found` | `auth_token` (or `auth_email`/`auth_key`) still contains the placeholder value |
 | `Zone '…' not found` | `zone_name` does not match any zone in your Cloudflare account |
 | `Record '…' not found` | The A record does not exist in Cloudflare yet — create it manually first |
-| `Another instance is already running` | A previous run is still active; or the lock was left behind — remove `/tmp/cloudflare-ddns-<uid>.lock` |
+| `Another instance is already running` | A previous run is still active; or the lock was left behind — remove `~/.local/state/cloudflare-ddns/lock` |
 | `Failed to get public IP` | The `ip_check_url` is unreachable; try `curl https://ipv4.icanhazip.com` manually |
 | DNS record keeps updating unexpectedly | Run with `--dry-run` to inspect what public IP and DNS IP are being detected without making changes |
 | Need to force an update regardless of current DNS value | Use `--force` to skip the DNS value check and update immediately; combine with `--dry-run` to preview the action first |

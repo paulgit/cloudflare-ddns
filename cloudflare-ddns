@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # cloudflare-ddns
-# Version: 2.6
+# Version: 2.7
 #
 # Uses Cloudflare as a Dynamic DNS provider to keep DNS records
 # automatically updated with the current public IP address.
@@ -19,8 +19,8 @@
 #  - Current DNS IP source: Cloudflare API rather than a dig
 #    query, eliminating DNS propagation lag and the dig
 #    dependency.
-#  - Concurrency guard: a per-user directory lock in /tmp
-#    prevents overlapping cron invocations.
+#  - Concurrency guard: a directory lock inside the per-user
+#    state directory prevents overlapping cron invocations.
 #  - Colour output: auto-detected via TTY; suppressed by the
 #    NO_COLOR env var (https://no-color.org/) or by the
 #    --no-color / --cron-mode command-line flags.
@@ -54,60 +54,73 @@ IFS=$'\n\t'
 # ------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME
-readonly VERSION="2.6"
+readonly VERSION="2.7"
 # Runtime data follows the XDG Base Directory Specification
 # (XDG_STATE_HOME, defaulting to ~/.local/state).
 readonly DATA_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cloudflare-ddns"
 readonly ID_FILE="$DATA_DIR/cloudflare.ids"
 readonly LOG_FILE="$DATA_DIR/cloudflare.log"
-# Per-user lock allows different users to run simultaneously.
-LOCK_FILE="/tmp/cloudflare-ddns-$(id -u).lock"
-readonly LOCK_FILE
+# The lock lives inside the per-user state directory (mode
+# 700), so no other local user can pre-create or remove it.
+readonly LOCK_DIR="$DATA_DIR/lock"
 
 # ------------------------------------------------------------
 # Global mutable variables
 # ------------------------------------------------------------
 # Default config path; overridden by --config in main().
-CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}"
-CONFIG_FILE+="/cloudflare-ddns/cloudflare-ddns.json"
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}"
+config_file+="/cloudflare-ddns/cloudflare-ddns.json"
 
 # Maximum log file size in bytes before rotation (1 MiB).
 readonly MAX_LOG_SIZE_IN_BYTES=1048576
 
-ZONE_IDENTIFIER=""
-RECORD_IDENTIFIER=""
-IP_CHECK_URLS=()
+zone_identifier=""
+record_identifier=""
+ip_check_urls=()
+
+# Set to 1 by acquire_lock once this process owns LOCK_DIR;
+# cleanup() only removes the lock when we own it.
+lock_acquired=0
+
+# Path of the curl stderr capture file currently in use, so
+# cleanup() can remove it if the script dies mid-request.
+curl_stderr_file=""
 
 # Set to 1 by --dry-run; skips the DNS record update API call.
-DRY_RUN=0
+dry_run=0
 
 # Set to 1 by --force; updates DNS without reading the current
 # DNS value first.
-FORCE_UPDATE=0
+force_update=0
 
 # Colour output: enabled when stdout or stderr is a terminal
 # and the NO_COLOR convention (https://no-color.org/) is unset.
 # Overridden to 0 by --no-color / --cron-mode in main().
-USE_COLOR=0
+use_color=0
 if { [[ -t 1 ]] || [[ -t 2 ]]; } \
      && [[ -z "${NO_COLOR:-}" ]]; then
-  USE_COLOR=1
+  use_color=1
 fi
 
 # Cloudflare API auth headers; populated by build_auth_args()
 # after the config file is parsed.
-declare -a CURL_AUTH_ARGS=()
+declare -a curl_auth_args=()
 
-# Check curl version once for retry support (requires 7.26.0+)
+# Check curl version once for retry support (requires
+# 7.26.0+). Both variables are computed once at startup and
+# then frozen, hence the uppercase readonly names.
 CURL_SUPPORTS_RETRY=0
 CURL_VERSION=""
 if command -v curl &>/dev/null; then
-  CURL_VERSION=$(curl --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  CURL_VERSION=$(curl --version 2>/dev/null | head -1 \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
   if [[ -n "$CURL_VERSION" ]] \
-      && [[ "$(printf '%s\n' '7.26.0' "$CURL_VERSION" | sort -V | head -1)" == '7.26.0' ]]; then
+      && [[ "$(printf '%s\n' '7.26.0' "$CURL_VERSION" \
+        | sort -V | head -1)" == '7.26.0' ]]; then
     CURL_SUPPORTS_RETRY=1
   fi
 fi
+readonly CURL_VERSION CURL_SUPPORTS_RETRY
 
 # ============================================================
 # _color_text
@@ -120,10 +133,10 @@ fi
 function _color_text() {
   local code="$1"
   local message="$2"
-  if [[ "$USE_COLOR" -eq 1 ]]; then
-    printf '\033[%sm%b\033[0m' "$code" "$message"
+  if [[ "$use_color" -eq 1 ]]; then
+    printf '\033[%sm%s\033[0m' "$code" "$message"
   else
-    printf '%b' "$message"
+    printf '%s' "$message"
   fi
 }
 
@@ -165,9 +178,7 @@ function _log_to_file() {
   local log_size=0
 
   if [[ -f "$LOG_FILE" ]]; then
-    log_size=$(stat -f%z "$LOG_FILE" 2>/dev/null \
-      || stat -c%s "$LOG_FILE" 2>/dev/null \
-      || printf '0')
+    log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || printf '0')
   fi
 
   if [[ "$log_size" -gt "$MAX_LOG_SIZE_IN_BYTES" ]]; then
@@ -216,6 +227,11 @@ function _warn() {
 # _error
 #   Prints a bold-red error with timestamp to stderr, appends
 #   it to the log file, and exits with code 2.
+#   Note: when called inside command substitution $(...), the
+#   exit only terminates the subshell; the script then aborts
+#   via errexit on the failed assignment. Do not wrap such
+#   assignments in conditionals (if/&&/||) or the abort is
+#   silently disabled.
 #   Input:  $1 - error message
 #   Output: timestamped error to stderr; entry in LOG_FILE;
 #           exits with code 2
@@ -289,13 +305,23 @@ function check_dependencies() {
 
 # ============================================================
 # cleanup
-#   Removes the lock directory on exit.
-#   Input:  none
-#   Output: lock directory removed if it exists
+#   Removes the lock directory on exit, but only when this
+#   process acquired it. Without the ownership check, an
+#   instance that aborts because the lock is held would delete
+#   the running instance's lock on its way out. Also removes
+#   the curl stderr capture file if one is still around.
+#   Input:  none (reads lock_acquired, curl_stderr_file)
+#   Output: lock directory removed if owned by this process;
+#           leftover curl stderr temp file removed
 #   Called by: trap on EXIT, trap on ERR
 # ============================================================
 function cleanup() {
-  [[ -d "${LOCK_FILE}" ]] && rm -rf "$LOCK_FILE"
+  if [[ "$lock_acquired" -eq 1 && -d "$LOCK_DIR" ]]; then
+    rm -rf "$LOCK_DIR"
+  fi
+  if [[ -n "$curl_stderr_file" && -f "$curl_stderr_file" ]]; then
+    rm -f "$curl_stderr_file"
+  fi
 }
 
 trap cleanup EXIT ERR
@@ -305,35 +331,52 @@ trap cleanup EXIT ERR
 #   Creates a lock directory atomically to prevent concurrent
 #   runs. Exits with an error if the lock is already held.
 #   Input:  none
-#   Output: lock directory and PID file created at LOCK_FILE
+#   Output: lock directory and PID file created at LOCK_DIR;
+#           lock_acquired global set to 1
 #   Called by: main
 # ============================================================
 function acquire_lock() {
-  if ! mkdir "$LOCK_FILE" 2>/dev/null; then
-    local lock_pid="unknown"
-    if [[ -f "$LOCK_FILE/pid" ]]; then
-      lock_pid=$(cat "$LOCK_FILE/pid")
-      if kill -0 "$lock_pid" 2>/dev/null; then
-        _error "Another instance is already running (PID: ${lock_pid})."
-      else
-        _warn "Removing stale lock from dead PID ${lock_pid}."
-        rm -rf "$LOCK_FILE"
-        mkdir "$LOCK_FILE" 2>/dev/null \
-          || _error "Failed to create lock directory after removing stale lock."
-      fi
-    else
-      _error "Lock directory exists but contains no PID file."
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    # A competitor may have created the lock a moment ago and
+    # not yet written its pid file. Wait briefly before
+    # concluding the lock is stale, so we don't destroy a live
+    # lock that is still being set up.
+    if [[ ! -f "$LOCK_DIR/pid" ]]; then
+      sleep 2
     fi
+    local lock_pid=""
+    if [[ -f "$LOCK_DIR/pid" ]]; then
+      lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null) || lock_pid=""
+    fi
+    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+      local err_msg="Another instance is already running"
+      err_msg+=" (PID: ${lock_pid})."
+      _error "$err_msg"
+    fi
+    # Dead PID, or no/unreadable pid file (a previous run was
+    # killed between mkdir and the pid write): treat as stale.
+    _warn "Removing stale lock (PID: ${lock_pid:-none})."
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null \
+      || _error "Failed to re-create lock after stale removal."
   fi
-  printf '%s\n' "$$" > "$LOCK_FILE/pid"
+  # Claim ownership immediately after the successful mkdir so
+  # cleanup() still removes the lock if the pid write below
+  # fails (errexit) or the process dies before completing it.
+  lock_acquired=1
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
 }
 
 # ============================================================
 # _valid_ip
-#   Validates whether a string is a valid IPv4 address.
+#   Validates whether a string is a valid IPv4 address. The
+#   value is matched as-is (no whitespace stripping), so a
+#   value that passes is safe to embed in the API JSON body.
+#   Callers must trim surrounding whitespace beforehand and
+#   then use the same trimmed value they validated.
 #   Input:  $1 - string to validate
 #   Output: returns 0 if valid, 1 if invalid
-#   Called by: check_for_ip_change
+#   Called by: check_for_ip_change, fetch_public_ip
 # ============================================================
 function _valid_ip() {
   local ip="$1"
@@ -341,10 +384,6 @@ function _valid_ip() {
   regex+='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.'
   regex+='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.'
   regex+='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])$'
-  ip="${ip//$'\n'/}"
-  ip="${ip//$'\r'/}"
-  ip="${ip//$'\t'/}"
-  ip="${ip// }"
 
   [[ "$ip" =~ $regex ]]
 }
@@ -366,7 +405,7 @@ function _url_encode() {
     local char="${string:$position:1}"
     case "$char" in
       [a-zA-Z0-9.~_-]) encoded+="$char" ;;
-      *) printf '%%%02X' "'$char" ;;
+      *) encoded+=$(printf '%%%02X' "'$char") ;;
     esac
   done
   printf '%s' "$encoded"
@@ -382,27 +421,30 @@ function _url_encode() {
 # ============================================================
 function init_data_dir() {
   if [[ ! -d "$DATA_DIR" ]]; then
-    umask 0077 && mkdir -p "$DATA_DIR"
+    # Subshell keeps the restrictive umask from leaking into
+    # the rest of the script.
+    (umask 0077 && mkdir -p "$DATA_DIR")
   fi
+  chmod 700 "$DATA_DIR"
 }
 
 # ============================================================
 # create_config_template
 #   Creates the config directory and writes a JSON template to
-#   CONFIG_FILE (mode 600), then exits so the user can edit it.
+#   config_file (mode 600), then exits so the user can edit it.
 #   Input:  none
-#   Output: config directory and CONFIG_FILE created
+#   Output: config directory and config_file created
 #   Called by: load_config
 # ============================================================
 function create_config_template() {
   local config_dir
-  config_dir="$(dirname "$CONFIG_FILE")"
+  config_dir="$(dirname "$config_file")"
   [[ -d "$config_dir" ]] || mkdir -p "$config_dir"
   chmod 700 "$config_dir"
 
   (
     umask 0077
-    cat > "$CONFIG_FILE" <<'EOF'
+    cat > "$config_file" <<'EOF'
 {
   "auth_token": "YOUR_CLOUDFLARE_API_TOKEN",
   "zone_name": "example.com",
@@ -414,7 +456,7 @@ function create_config_template() {
 }
 EOF
   )
-  chmod 600 "$CONFIG_FILE"
+  chmod 600 "$config_file"
 }
 
 # ============================================================
@@ -426,38 +468,37 @@ EOF
 #   Called by: load_config
 # ============================================================
 function validate_config() {
-  local var json_key
-  for var in ZONE_NAME RECORD_NAME; do
+  local var
+  for var in zone_name record_name; do
     if [[ -z "${!var:-}" ]]; then
-      json_key="${var,,}"
-      _error "Required field '${json_key}' not set in ${CONFIG_FILE}."
+      _error "Required field '${var}' not set in ${config_file}."
     fi
   done
 
-  if [[ "${#IP_CHECK_URLS[@]}" -eq 0 ]]; then
+  if [[ "${#ip_check_urls[@]}" -eq 0 ]]; then
     _error \
-      "Required field 'ip_check_urls' not set in ${CONFIG_FILE}."
+      "Required field 'ip_check_urls' not set in ${config_file}."
   fi
 
   local ip_check_url
-  for ip_check_url in "${IP_CHECK_URLS[@]}"; do
+  for ip_check_url in "${ip_check_urls[@]}"; do
     if [[ -z "$ip_check_url" ]]; then
       _error "Field 'ip_check_urls' contains an empty URL."
     fi
   done
 
   local auth_ok=0
-  if [[ -n "${AUTH_TOKEN:-}" ]] \
-      && ! [[ "${AUTH_TOKEN}" =~ ^YOUR_ ]]; then
+  if [[ -n "${auth_token:-}" ]] \
+      && ! [[ "${auth_token}" =~ ^YOUR_ ]]; then
     auth_ok=1
-  elif [[ -n "${AUTH_EMAIL:-}" && -n "${AUTH_KEY:-}" ]] \
-      && ! [[ "${AUTH_EMAIL}" =~ ^YOUR_ ]] \
-      && ! [[ "${AUTH_KEY}" =~ ^YOUR_ ]]; then
+  elif [[ -n "${auth_email:-}" && -n "${auth_key:-}" ]] \
+      && ! [[ "${auth_email}" =~ ^YOUR_ ]] \
+      && ! [[ "${auth_key}" =~ ^YOUR_ ]]; then
     auth_ok=1
   fi
 
   if [[ "$auth_ok" -eq 0 ]]; then
-    local msg="No valid auth found in ${CONFIG_FILE}."
+    local msg="No valid auth found in ${config_file}."
     msg+=" Set 'auth_token' or 'auth_email'+'auth_key'."
     _error "$msg"
   fi
@@ -465,25 +506,25 @@ function validate_config() {
 
 # ============================================================
 # build_auth_args
-#   Populates CURL_AUTH_ARGS for Cloudflare API requests.
+#   Populates curl_auth_args for Cloudflare API requests.
 #   API Token auth is preferred; the legacy Global API Key is
 #   used as a fallback with a deprecation warning.
-#   Input:  none (reads AUTH_TOKEN or AUTH_EMAIL + AUTH_KEY)
-#   Output: CURL_AUTH_ARGS array populated
+#   Input:  none (reads auth_token or auth_email + auth_key)
+#   Output: curl_auth_args array populated
 #   Called by: load_config
 # ============================================================
 function build_auth_args() {
   local ct="Content-Type: application/json"
-  if [[ -n "${AUTH_TOKEN:-}" ]]; then
-    CURL_AUTH_ARGS=(
-      "-H" "Authorization: Bearer ${AUTH_TOKEN}"
+  if [[ -n "${auth_token:-}" ]]; then
+    curl_auth_args=(
+      "-H" "Authorization: Bearer ${auth_token}"
       "-H" "$ct"
     )
   else
     _warn "Using legacy API Key auth. Switch to an API Token."
-    CURL_AUTH_ARGS=(
-      "-H" "X-Auth-Email: ${AUTH_EMAIL}"
-      "-H" "X-Auth-Key: ${AUTH_KEY}"
+    curl_auth_args=(
+      "-H" "X-Auth-Email: ${auth_email}"
+      "-H" "X-Auth-Key: ${auth_key}"
       "-H" "$ct"
     )
   fi
@@ -495,51 +536,58 @@ function build_auth_args() {
 #   run), validates its contents, and builds the API auth args.
 #   Supports both legacy 'ip_check_url' and new
 #   'ip_check_urls' formats.
-#   Input:  none (reads CONFIG_FILE global)
-#   Output: AUTH_TOKEN/EMAIL/KEY, ZONE_NAME, RECORD_NAME,
-#           IP_CHECK_URLS globals set; CURL_AUTH_ARGS built
+#   Input:  none (reads config_file global)
+#   Output: auth_token/auth_email/auth_key, zone_name,
+#           record_name,
+#           ip_check_urls globals set; curl_auth_args built
 #   Called by: main
 # ============================================================
 function load_config() {
-  if [[ ! -f "$CONFIG_FILE" ]]; then
+  if [[ ! -f "$config_file" ]]; then
     create_config_template
-    _warn "No config found. Template created at ${CONFIG_FILE}."
+    _warn "No config found. Template created at ${config_file}."
     _warn "Fill in your values, then re-run ${SCRIPT_NAME}."
     exit 1
   fi
 
+  # Insecure means any group/other access (last two mode
+  # digits non-zero); stricter modes such as 400 are left
+  # untouched.
   local current_mode
-  current_mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null \
-    || printf '000')
-  if [[ "$current_mode" != "600" ]]; then
-    _warn "Config file has insecure permissions ${current_mode}. Fixing to 600."
-    chmod 600 "$CONFIG_FILE"
+  current_mode=$(stat -c '%a' "$config_file" 2>/dev/null || true)
+  if [[ -z "$current_mode" \
+      || "${current_mode: -2}" != "00" ]]; then
+    local mode_msg="Config file permissions"
+    mode_msg+=" '${current_mode:-unknown}' allow group/other"
+    mode_msg+=" access. Fixing to 600."
+    _warn "$mode_msg"
+    chmod 600 "$config_file"
   fi
 
-  if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
-    _error "Config file contains invalid JSON: ${CONFIG_FILE}"
+  if ! jq empty "$config_file" 2>/dev/null; then
+    _error "Config file contains invalid JSON: ${config_file}"
   fi
 
-  AUTH_TOKEN=$(jq -r '.auth_token  // empty' "$CONFIG_FILE")
-  AUTH_EMAIL=$(jq -r '.auth_email  // empty' "$CONFIG_FILE")
-  AUTH_KEY=$(jq -r   '.auth_key    // empty' "$CONFIG_FILE")
-  ZONE_NAME=$(jq -r  '.zone_name   // empty' "$CONFIG_FILE")
-  RECORD_NAME=$(jq -r '.record_name // empty' "$CONFIG_FILE")
+  auth_token=$(jq -r '.auth_token  // empty' "$config_file")
+  auth_email=$(jq -r '.auth_email  // empty' "$config_file")
+  auth_key=$(jq -r   '.auth_key    // empty' "$config_file")
+  zone_name=$(jq -r  '.zone_name   // empty' "$config_file")
+  record_name=$(jq -r '.record_name // empty' "$config_file")
 
-  mapfile -t IP_CHECK_URLS < <(
+  mapfile -t ip_check_urls < <(
     jq -r '
       if (.ip_check_urls | type) == "array" then
         .ip_check_urls[]? // empty
       else
         .ip_check_url // empty
       end
-    ' "$CONFIG_FILE"
+    ' "$config_file"
   )
 
   if jq -e '
       (.ip_check_urls | type) != "array"
       and (.ip_check_url // empty) != ""
-    ' "$CONFIG_FILE" >/dev/null 2>&1; then
+    ' "$config_file" >/dev/null 2>&1; then
     _warn "Legacy config key 'ip_check_url' detected."
     _warn "Please migrate to 'ip_check_urls' (array) per README."
   fi
@@ -565,13 +613,16 @@ function cloudflare_api_call() {
   local data="${3:-}"
   local response
 
+  # --show-error re-enables curl's error messages (suppressed
+  # by --silent) so the stderr capture below has content.
   local -a curl_args=(
     "--silent"
+    "--show-error"
     "--connect-timeout" "10"
     "--max-time" "30"
     "--request" "$method"
     "https://api.cloudflare.com${endpoint}"
-    "${CURL_AUTH_ARGS[@]}"
+    "${curl_auth_args[@]}"
   )
 
   if [[ "$CURL_SUPPORTS_RETRY" -eq 1 ]]; then
@@ -581,15 +632,18 @@ function cloudflare_api_call() {
 
   [[ -n "$data" ]] && curl_args+=("--data" "$data")
 
-  local curl_stderr
-  curl_stderr=$(mktemp)
-  response=$(curl "${curl_args[@]}" 2>"$curl_stderr") || {
-    local detail
-    detail=$(head -1 "$curl_stderr" 2>/dev/null)
-    rm -f "$curl_stderr"
-    _error "Network error calling Cloudflare API (${method} ${endpoint}): ${detail:-unknown}"
+  curl_stderr_file=$(mktemp)
+  response=$(curl "${curl_args[@]}" 2>"$curl_stderr_file") || {
+    local detail err_msg
+    detail=$(head -1 "$curl_stderr_file" 2>/dev/null)
+    rm -f "$curl_stderr_file"
+    curl_stderr_file=""
+    err_msg="Network error calling Cloudflare API"
+    err_msg+=" (${method} ${endpoint}): ${detail:-unknown}"
+    _error "$err_msg"
   }
-  rm -f "$curl_stderr"
+  rm -f "$curl_stderr_file"
+  curl_stderr_file=""
   printf '%s' "$response"
 }
 
@@ -628,36 +682,39 @@ function check_api_response() {
 # fetch_identifiers
 #   Retrieves zone and record identifiers from the Cloudflare
 #   API and caches them in ID_FILE (mode 600).
-#   Input:  none (reads ZONE_NAME, RECORD_NAME globals)
-#   Output: ZONE_IDENTIFIER and RECORD_IDENTIFIER set;
+#   Input:  none (reads zone_name, record_name globals)
+#   Output: zone_identifier and record_identifier set;
 #           ID_FILE written with mode 600
 #   Called by: load_or_fetch_identifiers
 # ============================================================
 function fetch_identifiers() {
-  local response zone_id record_id
+  local response zone_id record_id endpoint
 
   response=$(cloudflare_api_call "GET" \
-    "/client/v4/zones?name=$(_url_encode "${ZONE_NAME}")")
+    "/client/v4/zones?name=$(_url_encode "${zone_name}")")
   check_api_response "Zone lookup" "$response"
   zone_id=$(printf '%s' "$response" \
     | jq -r '.result[0].id // empty')
   if [[ ${#zone_id} -ne 32 ]]; then
-    _error "Zone '${ZONE_NAME}' not found in your account."
+    _error "Zone '${zone_name}' not found in your account."
   fi
 
-  response=$(cloudflare_api_call "GET" \
-    "/client/v4/zones/${zone_id}/dns_records?name=$(_url_encode "${RECORD_NAME}")")
+  # Filter by type=A so a record that also has AAAA/TXT entries
+  # under the same name cannot return the wrong record ID.
+  endpoint="/client/v4/zones/${zone_id}/dns_records"
+  endpoint+="?type=A&name=$(_url_encode "${record_name}")"
+  response=$(cloudflare_api_call "GET" "$endpoint")
   check_api_response "DNS record lookup" "$response"
   record_id=$(printf '%s' "$response" \
     | jq -r '.result[0].id // empty')
   if [[ ${#record_id} -ne 32 ]]; then
-    _error "Record '${RECORD_NAME}' not found in '${ZONE_NAME}'."
+    _error "Record '${record_name}' not found in '${zone_name}'."
   fi
 
-  ZONE_IDENTIFIER="$zone_id"
-  RECORD_IDENTIFIER="$record_id"
+  zone_identifier="$zone_id"
+  record_identifier="$record_id"
   {
-    printf 'ZONE_IDENTIFIER=%s\nRECORD_IDENTIFIER=%s\n' \
+    printf 'zone_identifier=%s\nrecord_identifier=%s\n' \
       "$zone_id" "$record_id"
   } > "$ID_FILE"
   chmod 600 "$ID_FILE"
@@ -669,7 +726,7 @@ function fetch_identifiers() {
 #   from the Cloudflare API when the cache is absent or
 #   incomplete.
 #   Input:  none
-#   Output: ZONE_IDENTIFIER and RECORD_IDENTIFIER set
+#   Output: zone_identifier and record_identifier set
 #   Called by: main
 # ============================================================
 function load_or_fetch_identifiers() {
@@ -677,16 +734,16 @@ function load_or_fetch_identifiers() {
     local key value valid=true
     while IFS='=' read -r key value; do
       case "$key" in
-        ZONE_IDENTIFIER)
+        zone_identifier)
           if [[ "$value" =~ ^[a-f0-9]{32}$ ]]; then
-            ZONE_IDENTIFIER="$value"
+            zone_identifier="$value"
           else
             valid=false
           fi
           ;;
-        RECORD_IDENTIFIER)
+        record_identifier)
           if [[ "$value" =~ ^[a-f0-9]{32}$ ]]; then
-            RECORD_IDENTIFIER="$value"
+            record_identifier="$value"
           else
             valid=false
           fi
@@ -695,13 +752,13 @@ function load_or_fetch_identifiers() {
     done < "$ID_FILE"
     if [[ "$valid" != "true" ]]; then
       _warn "ID cache corrupted; fetching from API."
-      ZONE_IDENTIFIER=""
-      RECORD_IDENTIFIER=""
+      zone_identifier=""
+      record_identifier=""
     fi
   fi
 
-  if [[ ${#ZONE_IDENTIFIER} -eq 32 \
-      && ${#RECORD_IDENTIFIER} -eq 32 ]]; then
+  if [[ ${#zone_identifier} -eq 32 \
+      && ${#record_identifier} -eq 32 ]]; then
     return 0
   fi
 
@@ -712,15 +769,15 @@ function load_or_fetch_identifiers() {
 # ============================================================
 # get_current_dns_ip
 #   Retrieves the content (IP address) of the DNS A record
-#   currently stored in Cloudflare for RECORD_NAME.
+#   currently stored in Cloudflare for record_name.
 #   Input:  none
 #   Output: current IP string to stdout
 #   Called by: check_for_ip_change
 # ============================================================
 function get_current_dns_ip() {
   local response current_ip endpoint
-  endpoint="/client/v4/zones/${ZONE_IDENTIFIER}"
-  endpoint+="/dns_records/${RECORD_IDENTIFIER}"
+  endpoint="/client/v4/zones/${zone_identifier}"
+  endpoint+="/dns_records/${record_identifier}"
   response=$(cloudflare_api_call "GET" "$endpoint")
   check_api_response "Current record fetch" "$response"
   current_ip=$(printf '%s' "$response" \
@@ -729,11 +786,29 @@ function get_current_dns_ip() {
 }
 
 # ============================================================
+# patch_dns_record_content
+#   Sends the PATCH request that sets the A record's content
+#   to the given IP. PATCH preserves the other record fields
+#   (proxied, TTL). Shared by the normal and forced paths.
+#   Input:  $1 - new IP address
+#   Output: DNS record updated via the Cloudflare API
+#   Called by: update_dns_record, force_update_ip
+# ============================================================
+function patch_dns_record_content() {
+  local new_ip="$1"
+  local response endpoint
+  endpoint="/client/v4/zones/${zone_identifier}"
+  endpoint+="/dns_records/${record_identifier}"
+  response=$(cloudflare_api_call "PATCH" "$endpoint" \
+    "{\"content\":\"${new_ip}\"}")
+  check_api_response "DNS record update" "$response"
+}
+
+# ============================================================
 # update_dns_record
-#   Updates the Cloudflare A record for RECORD_NAME using PATCH
-#   so that other record fields (proxied, TTL) are preserved.
-#   In dry-run mode the PATCH is skipped and the intended
-#   change is logged instead.
+#   Updates the Cloudflare A record for record_name. In
+#   dry-run mode the PATCH is skipped and the intended change
+#   is logged instead.
 #   Input:  $1 - new IP address
 #           $2 - previous IP address (for the log message)
 #   Output: DNS record updated (or dry-run message) and logged
@@ -742,25 +817,21 @@ function get_current_dns_ip() {
 function update_dns_record() {
   local new_ip="$1"
   local old_ip="$2"
-  local response endpoint
-  endpoint="/client/v4/zones/${ZONE_IDENTIFIER}"
-  endpoint+="/dns_records/${RECORD_IDENTIFIER}"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    _info "[DRY-RUN] Would update ${RECORD_NAME}: ${old_ip} -> ${new_ip}"
+  if [[ "$dry_run" -eq 1 ]]; then
+    _info \
+      "[DRY-RUN] Would update ${record_name}: ${old_ip} -> ${new_ip}"
     return 0
   fi
 
-  response=$(cloudflare_api_call "PATCH" "$endpoint" \
-    "{\"content\":\"${new_ip}\"}")
-  check_api_response "DNS record update" "$response"
-  _info "${RECORD_NAME}: ${old_ip} -> ${new_ip}"
+  patch_dns_record_content "$new_ip"
+  _info "${record_name}: ${old_ip} -> ${new_ip}"
 }
 
 # ============================================================
 # fetch_public_ip
 #   Fetches the current public IPv4 address using the ordered
-#   URLs from IP_CHECK_URLS. If one URL fails or returns an
+#   URLs from ip_check_urls. If one URL fails or returns an
 #   invalid value, the next URL is tried.
 #   Input:  none
 #   Output: validated public IP address to stdout
@@ -770,9 +841,12 @@ function fetch_public_ip() {
   local ip_check_url new_ip
   local -a curl_ip_args
 
-  for ip_check_url in "${IP_CHECK_URLS[@]}"; do
+  for ip_check_url in "${ip_check_urls[@]}"; do
+    # --show-error re-enables curl's error messages (suppressed
+    # by --silent) so the stderr capture below has content.
     curl_ip_args=(
       "--silent"
+      "--show-error"
       "--connect-timeout" "5"
       "--max-time" "10"
       "$ip_check_url"
@@ -782,20 +856,33 @@ function fetch_public_ip() {
       curl_ip_args+=("--retry-delay" "3")
     fi
 
-    local curl_stderr
-    curl_stderr=$(mktemp)
-    if ! new_ip=$(curl "${curl_ip_args[@]}" 2>"$curl_stderr"); then
-      local detail
-      detail=$(head -1 "$curl_stderr" 2>/dev/null)
-      rm -f "$curl_stderr"
-      _warn "Failed to get public IP from ${ip_check_url}: ${detail:-unknown}; trying next URL."
+    curl_stderr_file=$(mktemp)
+    if ! new_ip=$(curl "${curl_ip_args[@]}" \
+        2>"$curl_stderr_file"); then
+      local detail warn_msg
+      detail=$(head -1 "$curl_stderr_file" 2>/dev/null)
+      rm -f "$curl_stderr_file"
+      curl_stderr_file=""
+      warn_msg="Failed to get public IP from ${ip_check_url}:"
+      warn_msg+=" ${detail:-unknown}; trying next URL."
+      _warn "$warn_msg"
       continue
     fi
-    rm -f "$curl_stderr"
+    rm -f "$curl_stderr_file"
+    curl_stderr_file=""
+
+    # HTTP endpoints may end the body with CRLF; command
+    # substitution strips the trailing newline but not the
+    # carriage return. Trim surrounding whitespace, then
+    # validate and use that same trimmed value. Embedded
+    # whitespace still fails validation.
+    new_ip="${new_ip#"${new_ip%%[![:space:]]*}"}"
+    new_ip="${new_ip%"${new_ip##*[![:space:]]}"}"
 
     if ! _valid_ip "$new_ip"; then
-      _warn \
-        "Public IP check from ${ip_check_url} returned invalid value: '${new_ip}'."
+      local invalid_msg="Public IP check from ${ip_check_url}"
+      invalid_msg+=" returned invalid value: '${new_ip}'."
+      _warn "$invalid_msg"
       continue
     fi
 
@@ -803,8 +890,9 @@ function fetch_public_ip() {
     return 0
   done
 
-  _error \
-    "All configured IP check URLs failed. Check 'ip_check_urls' in ${CONFIG_FILE}."
+  local fail_msg="All configured IP check URLs failed."
+  fail_msg+=" Check 'ip_check_urls' in ${config_file}."
+  _error "$fail_msg"
 }
 
 # ============================================================
@@ -832,9 +920,9 @@ function check_for_ip_change() {
 
   if [[ "$new_ip" != "$old_ip" ]]; then
     update_dns_record "$new_ip" "$old_ip"
-  elif [[ "$DRY_RUN" -eq 1 ]]; then
+  elif [[ "$dry_run" -eq 1 ]]; then
     _info \
-      "[DRY-RUN] No change needed. ${RECORD_NAME} is already ${new_ip}"
+      "[DRY-RUN] No change needed. ${record_name} is already ${new_ip}"
   fi
 }
 
@@ -850,23 +938,19 @@ function check_for_ip_change() {
 #   Called by: main
 # ============================================================
 function force_update_ip() {
-  local new_ip endpoint response
+  local new_ip
   new_ip=$(fetch_public_ip)
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    local msg="[DRY-RUN] [FORCED] Would update ${RECORD_NAME}"
+  if [[ "$dry_run" -eq 1 ]]; then
+    local msg="[DRY-RUN] [FORCED] Would update ${record_name}"
     msg+=" to ${new_ip} (DNS check skipped)"
     _info "$msg"
     return 0
   fi
 
-  endpoint="/client/v4/zones/${ZONE_IDENTIFIER}"
-  endpoint+="/dns_records/${RECORD_IDENTIFIER}"
-  response=$(cloudflare_api_call "PATCH" "$endpoint" \
-    "{\"content\":\"${new_ip}\"}")
-  check_api_response "DNS record update" "$response"
+  patch_dns_record_content "$new_ip"
   _info \
-    "[FORCED] ${RECORD_NAME}: updated to ${new_ip} (DNS check skipped)"
+    "[FORCED] ${record_name}: updated to ${new_ip} (DNS check skipped)"
 }
 
 # ============================================================
@@ -887,24 +971,24 @@ function main() {
         exit 0
         ;;
       --dry-run)
-        DRY_RUN=1
+        dry_run=1
         ;;
       --force)
-        FORCE_UPDATE=1
+        force_update=1
         ;;
       --no-color|--cron-mode)
-        USE_COLOR=0
+        use_color=0
         ;;
       --config)
         if [[ $# -lt 2 || -z "${2:-}" ]]; then
           _error "--config requires a file path argument."
         fi
-        CONFIG_FILE="$2"
+        config_file="$2"
         shift
         ;;
       --config=*)
-        CONFIG_FILE="${1#--config=}"
-        if [[ -z "$CONFIG_FILE" ]]; then
+        config_file="${1#--config=}"
+        if [[ -z "$config_file" ]]; then
           _error "--config= requires a file path argument."
         fi
         ;;
@@ -924,12 +1008,12 @@ function main() {
 
   # When --force is used, discard the cached identifiers so they
   # are re-fetched from the API (handles zone/record renames).
-  if [[ "$FORCE_UPDATE" -eq 1 ]] && [[ -f "$ID_FILE" ]]; then
+  if [[ "$force_update" -eq 1 ]] && [[ -f "$ID_FILE" ]]; then
     rm -f "$ID_FILE"
   fi
 
   load_or_fetch_identifiers
-  if [[ "$FORCE_UPDATE" -eq 1 ]]; then
+  if [[ "$force_update" -eq 1 ]]; then
     force_update_ip
   else
     check_for_ip_change
