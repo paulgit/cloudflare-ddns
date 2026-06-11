@@ -78,6 +78,10 @@ ZONE_IDENTIFIER=""
 RECORD_IDENTIFIER=""
 IP_CHECK_URLS=()
 
+# Set to 1 by acquire_lock once this process owns LOCK_FILE;
+# cleanup() only removes the lock when we own it.
+lock_acquired=0
+
 # Set to 1 by --dry-run; skips the DNS record update API call.
 DRY_RUN=0
 
@@ -165,9 +169,7 @@ function _log_to_file() {
   local log_size=0
 
   if [[ -f "$LOG_FILE" ]]; then
-    log_size=$(stat -f%z "$LOG_FILE" 2>/dev/null \
-      || stat -c%s "$LOG_FILE" 2>/dev/null \
-      || printf '0')
+    log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || printf '0')
   fi
 
   if [[ "$log_size" -gt "$MAX_LOG_SIZE_IN_BYTES" ]]; then
@@ -289,13 +291,18 @@ function check_dependencies() {
 
 # ============================================================
 # cleanup
-#   Removes the lock directory on exit.
-#   Input:  none
-#   Output: lock directory removed if it exists
+#   Removes the lock directory on exit, but only when this
+#   process acquired it. Without the ownership check, an
+#   instance that aborts because the lock is held would delete
+#   the running instance's lock on its way out.
+#   Input:  none (reads lock_acquired global)
+#   Output: lock directory removed if owned by this process
 #   Called by: trap on EXIT, trap on ERR
 # ============================================================
 function cleanup() {
-  [[ -d "${LOCK_FILE}" ]] && rm -rf "$LOCK_FILE"
+  if [[ "$lock_acquired" -eq 1 && -d "$LOCK_FILE" ]]; then
+    rm -rf "$LOCK_FILE"
+  fi
 }
 
 trap cleanup EXIT ERR
@@ -305,7 +312,8 @@ trap cleanup EXIT ERR
 #   Creates a lock directory atomically to prevent concurrent
 #   runs. Exits with an error if the lock is already held.
 #   Input:  none
-#   Output: lock directory and PID file created at LOCK_FILE
+#   Output: lock directory and PID file created at LOCK_FILE;
+#           lock_acquired global set to 1
 #   Called by: main
 # ============================================================
 function acquire_lock() {
@@ -326,14 +334,19 @@ function acquire_lock() {
     fi
   fi
   printf '%s\n' "$$" > "$LOCK_FILE/pid"
+  lock_acquired=1
 }
 
 # ============================================================
 # _valid_ip
-#   Validates whether a string is a valid IPv4 address.
+#   Validates whether a string is a valid IPv4 address. The
+#   raw value is matched as-is (no whitespace stripping), so a
+#   value that passes is safe to embed in the API JSON body.
+#   Trailing newlines from curl are already removed by the
+#   caller's command substitution.
 #   Input:  $1 - string to validate
 #   Output: returns 0 if valid, 1 if invalid
-#   Called by: check_for_ip_change
+#   Called by: check_for_ip_change, fetch_public_ip
 # ============================================================
 function _valid_ip() {
   local ip="$1"
@@ -341,10 +354,6 @@ function _valid_ip() {
   regex+='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.'
   regex+='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.'
   regex+='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])$'
-  ip="${ip//$'\n'/}"
-  ip="${ip//$'\r'/}"
-  ip="${ip//$'\t'/}"
-  ip="${ip// }"
 
   [[ "$ip" =~ $regex ]]
 }
@@ -366,7 +375,7 @@ function _url_encode() {
     local char="${string:$position:1}"
     case "$char" in
       [a-zA-Z0-9.~_-]) encoded+="$char" ;;
-      *) printf '%%%02X' "'$char" ;;
+      *) encoded+=$(printf '%%%02X' "'$char") ;;
     esac
   done
   printf '%s' "$encoded"
@@ -382,8 +391,11 @@ function _url_encode() {
 # ============================================================
 function init_data_dir() {
   if [[ ! -d "$DATA_DIR" ]]; then
-    umask 0077 && mkdir -p "$DATA_DIR"
+    # Subshell keeps the restrictive umask from leaking into
+    # the rest of the script.
+    (umask 0077 && mkdir -p "$DATA_DIR")
   fi
+  chmod 700 "$DATA_DIR"
 }
 
 # ============================================================
@@ -508,11 +520,17 @@ function load_config() {
     exit 1
   fi
 
+  # Insecure means any group/other access (last two mode
+  # digits non-zero); stricter modes such as 400 are left
+  # untouched.
   local current_mode
-  current_mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null \
-    || printf '000')
-  if [[ "$current_mode" != "600" ]]; then
-    _warn "Config file has insecure permissions ${current_mode}. Fixing to 600."
+  current_mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || true)
+  if [[ -z "$current_mode" \
+      || "${current_mode: -2}" != "00" ]]; then
+    local mode_msg="Config file permissions"
+    mode_msg+=" '${current_mode:-unknown}' allow group/other"
+    mode_msg+=" access. Fixing to 600."
+    _warn "$mode_msg"
     chmod 600 "$CONFIG_FILE"
   fi
 
@@ -634,7 +652,7 @@ function check_api_response() {
 #   Called by: load_or_fetch_identifiers
 # ============================================================
 function fetch_identifiers() {
-  local response zone_id record_id
+  local response zone_id record_id endpoint
 
   response=$(cloudflare_api_call "GET" \
     "/client/v4/zones?name=$(_url_encode "${ZONE_NAME}")")
@@ -645,8 +663,11 @@ function fetch_identifiers() {
     _error "Zone '${ZONE_NAME}' not found in your account."
   fi
 
-  response=$(cloudflare_api_call "GET" \
-    "/client/v4/zones/${zone_id}/dns_records?name=$(_url_encode "${RECORD_NAME}")")
+  # Filter by type=A so a record that also has AAAA/TXT entries
+  # under the same name cannot return the wrong record ID.
+  endpoint="/client/v4/zones/${zone_id}/dns_records"
+  endpoint+="?type=A&name=$(_url_encode "${RECORD_NAME}")"
+  response=$(cloudflare_api_call "GET" "$endpoint")
   check_api_response "DNS record lookup" "$response"
   record_id=$(printf '%s' "$response" \
     | jq -r '.result[0].id // empty')
